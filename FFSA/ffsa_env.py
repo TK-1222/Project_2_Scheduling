@@ -233,7 +233,7 @@ class GraphBuilder:
         """(op, candidate, machine) with edge_attr=[pijk_norm, siijk_norm]"""
         src, dst, attrs = [], [], []
         for op in env.operations.values():
-            if op.is_done:
+            if op.is_done or op.is_processing:
                 continue
             for mid in self.inst.machines_by_stage.get(op.stage_id, []):
                 m_data = self.inst.machines[mid]
@@ -368,7 +368,7 @@ class FFSASchedulingEnv(gym.Env):
         # 조립 의존성: assembly op의 component_last_ops 설정
         for job in self.instance.jobs.values():
             if job.component_jobs and job.route:
-                asm_stage = job.route[0]  # 조립 job의 첫 stage = 조립 stage
+                asm_stage = job.assembly_stage  # j_i^asm: job i의 조립 공정 (PPT 집합/인덱스)
                 asm_op_id = self.job_stage_to_op.get((job.job_id, asm_stage))
                 if asm_op_id is not None:
                     asm_op = self.operations[asm_op_id]
@@ -580,11 +580,13 @@ class FFSASchedulingEnv(gym.Env):
                 next_op.buffer_waiting = True
             else:
                 # ★ 단순 blocking: machine을 차단 상태로 유지
+                # current_op이 None인 경우에만 blocking (다른 job이 이미 점유 중이면 skip)
                 if op.machine_id is not None:
                     ms = self.machine_states[op.machine_id]
-                    ms.is_blocked = True
-                    ms.is_idle = False
-                    ms.blocked_job = job_id
+                    if ms.current_op is None and not ms.is_blocked:
+                        ms.is_blocked = True
+                        ms.is_idle = False
+                        ms.blocked_job = job_id
 
     def _check_and_enqueue_assembly_jobs(self):
         """[Fix #1] Assembly final job의 buffer 진입 조건을 매 이벤트 시점마다 확인.

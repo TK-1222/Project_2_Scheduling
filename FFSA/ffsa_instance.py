@@ -210,9 +210,13 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
                         )
 
     # ── 버퍼 용량 (Bj) ──
+    # PPT 문제 정의: 첫 번째 스테이지 전 버퍼는 용량이 무한이라 가정
     buffer_capacities: Dict[int, int] = {}
     for sid in stages:
-        buffer_capacities[sid] = config.buffer_capacity if config.use_finite_buffer else -1
+        if sid == stages[0]:
+            buffer_capacities[sid] = -1
+        else:
+            buffer_capacities[sid] = config.buffer_capacity if config.use_finite_buffer else -1
 
     # ── Due date (dp) = CLB × tightness ──
     for p, prod in products.items():
