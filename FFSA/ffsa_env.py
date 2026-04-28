@@ -614,9 +614,12 @@ class FFSASchedulingEnv(gym.Env):
                 continue
 
             # 조립 stage buffer에 공간이 있으면 진입
+            # PPT 제약식 10: WIP_asm 은 component 수 기준으로 카운트
             asm_stage = job.route[0]
             buf = self.buffers[asm_stage]
-            if buf.has_space():
+            n_comp = len(first_op.component_last_ops)
+            can_enter = (buf.capacity < 0) or (len(buf.queue) + n_comp <= buf.capacity)
+            if can_enter:
                 if job.job_id not in buf.queue:
                     buf.push(job.job_id)
                 first_op.buffer_waiting = True
@@ -795,7 +798,7 @@ class FFSASchedulingEnv(gym.Env):
             if op.is_processing and op.completion_time is not None:
                 t = max(t, op.completion_time)
                 continue
-            # 미시작 → 최소 처리시간 추가
+            # 미시작 → 최소 처리시간 + 최소 setup time 추가 (B안: optimistic estimate)
             compatible = [
                 mid for mid in self.instance.machines_by_stage.get(stage_id, [])
                 if job.product_id in self.instance.machines[mid].compatible_products
@@ -806,7 +809,14 @@ class FFSASchedulingEnv(gym.Env):
                     for mid in compatible
                 )
                 if min_proc < float('inf'):
-                    t += min_proc
+                    min_setup = min(
+                        (self.instance.setup_times.get((prev_p, job.product_id, stage_id, mid), 0.0)
+                         for prev_p in range(self.instance.num_products)
+                         if prev_p != job.product_id
+                         for mid in compatible),
+                        default=0.0
+                    ) if self.instance.setup_times else 0.0
+                    t += min_proc + min_setup
         return t
 
     def compute_product_clb(self, product_id: int) -> float:
