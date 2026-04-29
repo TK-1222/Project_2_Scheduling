@@ -26,7 +26,7 @@ class InstanceConfig:
     components_per_product: int = 2      # 조립 시 component job 수
     num_stages: int = 6
     assembly_stage_idx: int = 3          # 조립 stage 인덱스 (0-based)
-    machines_per_stage: Optional[List[int]] = None  # None → 2로 통일
+    machines_per_stage: Optional[List[int]] = field(default_factory=lambda: [2, 2, 2, 2, 2, 2])
     processing_time_range: Tuple[float, float] = (5.0, 40.0)
     setup_time_range: Tuple[float, float] = (2.0, 10.0)
     buffer_capacity: int = 10
@@ -284,7 +284,7 @@ def _estimate_product_clb(
 def simple_config(**kwargs) -> InstanceConfig:
     """Step 1: 단순 FFSA (assembly 없음, setup 없음, 무한 버퍼)"""
     defaults = dict(
-        num_products=4, num_stages=4, machines_per_stage=[2, 2, 2, 2],
+        num_stages=4, machines_per_stage=[2, 2, 2, 2],
         use_assembly=False, use_setup=False, use_finite_buffer=False,
     )
     defaults.update(kwargs)
@@ -294,10 +294,7 @@ def simple_config(**kwargs) -> InstanceConfig:
 def assembly_config(**kwargs) -> InstanceConfig:
     """Step 2: Assembly 포함"""
     defaults = dict(
-        num_products=4, components_per_product=2,
-        num_stages=6, assembly_stage_idx=3,
-        machines_per_stage=[2, 2, 2, 2, 2, 2],
-        use_assembly=True, use_setup=False, use_finite_buffer=False,
+        use_setup=False, use_finite_buffer=False,
     )
     defaults.update(kwargs)
     return InstanceConfig(**defaults)
@@ -305,11 +302,4 @@ def assembly_config(**kwargs) -> InstanceConfig:
 
 def full_config(**kwargs) -> InstanceConfig:
     """Step 3: Setup + Buffer 포함"""
-    defaults = dict(
-        num_products=4, components_per_product=2,
-        num_stages=6, assembly_stage_idx=3,
-        machines_per_stage=[2, 2, 2, 2, 2, 2],
-        use_assembly=True, use_setup=True, use_finite_buffer=True,
-    )
-    defaults.update(kwargs)
-    return InstanceConfig(**defaults)
+    return InstanceConfig(**kwargs)
