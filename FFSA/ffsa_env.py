@@ -36,7 +36,8 @@ class OperationState:
     """Operation 런타임 상태 (PPT: Oij)"""
     op_id: int
     job_id: int
-    product_id: int
+    product_id: int              # 제품 타입 (setup time·기계 호환성 기준)
+    order_id: int                # 주문 ID (ProductData key)
     stage_id: int
     # 상태 플래그
     is_done: bool = False
@@ -173,10 +174,10 @@ class GraphBuilder:
             feats[i, 7] = op.stage_id / max(self.inst.num_stages - 1, 1)
             feats[i, 8] = op.product_id / max(self.inst.num_products - 1, 1)
             # CLB
-            clb = env.compute_product_clb(op.product_id)
+            clb = env.compute_product_clb(op.order_id)
             feats[i, 9] = clb / self.max_due if self.max_due > 0 else 0.0
             # due_date / weight
-            prod = self.inst.products[op.product_id]
+            prod = self.inst.products[op.order_id]
             feats[i, 10] = prod.due_date / self.max_due if self.max_due > 0 else 0.0
             feats[i, 11] = prod.weight / self.max_weight if self.max_weight > 0 else 0.0
             # slack & tardiness_est
@@ -353,6 +354,7 @@ class FFSASchedulingEnv(gym.Env):
                     op_id=op_id,
                     job_id=job.job_id,
                     product_id=job.product_id,
+                    order_id=job.order_id,
                     stage_id=stage_id,
                     is_assembly=is_asm,
                     predecessors=predecessors,
@@ -819,9 +821,9 @@ class FFSASchedulingEnv(gym.Env):
                     t += min_proc + min_setup
         return t
 
-    def compute_product_clb(self, product_id: int) -> float:
-        """제품의 CLB = 최종 job의 CLB"""
-        prod = self.instance.products[product_id]
+    def compute_product_clb(self, order_id: int) -> float:
+        """주문의 CLB = 최종 job의 CLB"""
+        prod = self.instance.products[order_id]
         return self.compute_job_clb(prod.final_job_id)
 
     def compute_weighted_estimated_tardiness(self) -> float:
