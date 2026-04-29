@@ -310,7 +310,6 @@ def full_config(**kwargs) -> InstanceConfig:
         num_stages=6, assembly_stage_idx=3,
         machines_per_stage=[2, 2, 2, 2, 2, 2],
         use_assembly=True, use_setup=True, use_finite_buffer=True,
-        buffer_capacity=10,
     )
     defaults.update(kwargs)
     return InstanceConfig(**defaults)
