@@ -210,13 +210,17 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
                         )
 
     # ── 버퍼 용량 (Bj) ──
+    # PPT 문제 정의: 첫 번째 스테이지 전 버퍼는 용량이 무한이라 가정
     buffer_capacities: Dict[int, int] = {}
     for sid in stages:
-        buffer_capacities[sid] = config.buffer_capacity if config.use_finite_buffer else -1
+        if sid == stages[0]:
+            buffer_capacities[sid] = -1
+        else:
+            buffer_capacities[sid] = config.buffer_capacity if config.use_finite_buffer else -1
 
     # ── Due date (dp) = CLB × tightness ──
     for p, prod in products.items():
-        clb = _estimate_product_clb(prod, jobs, machines, machines_by_stage, processing_times)
+        clb = _estimate_product_clb(prod, jobs, machines, machines_by_stage, processing_times, setup_times)
         prod.due_date = clb * config.due_date_tightness
 
     return FFSAInstance(
@@ -241,9 +245,11 @@ def _estimate_product_clb(
     machines: Dict[int, MachineData],
     machines_by_stage: Dict[int, List[int]],
     processing_times: Dict[Tuple[int, int, int], float],
+    setup_times: Dict[Tuple[int, int, int, int], float] = None,
 ) -> float:
     """인스턴스 생성 시 rough CLB 추정 (due date 계산용)"""
     final = jobs[product.final_job_id]
+    all_product_ids = list(set(j.product_id for j in jobs.values()))
 
     def _job_lb(job_id: int) -> float:
         job = jobs[job_id]
@@ -252,7 +258,15 @@ def _estimate_product_clb(
             compat = [mid for mid in machines_by_stage[sid]
                       if job.product_id in machines[mid].compatible_products]
             if compat:
-                lb += min(processing_times[(job_id, sid, mid)] for mid in compat)
+                min_proc = min(processing_times[(job_id, sid, mid)] for mid in compat)
+                # 최소 setup time 추정 (B안: compute_job_clb와 일관성 유지)
+                min_setup = min(
+                    (setup_times.get((pf, job.product_id, sid, mid), 0.0)
+                     for pf in all_product_ids if pf != job.product_id
+                     for mid in compat),
+                    default=0.0
+                ) if setup_times else 0.0
+                lb += min_proc + min_setup
         return lb
 
     if final.component_jobs:

@@ -233,7 +233,7 @@ class GraphBuilder:
         """(op, candidate, machine) with edge_attr=[pijk_norm, siijk_norm]"""
         src, dst, attrs = [], [], []
         for op in env.operations.values():
-            if op.is_done:
+            if op.is_done or op.is_processing:
                 continue
             for mid in self.inst.machines_by_stage.get(op.stage_id, []):
                 m_data = self.inst.machines[mid]
@@ -368,7 +368,7 @@ class FFSASchedulingEnv(gym.Env):
         # 조립 의존성: assembly op의 component_last_ops 설정
         for job in self.instance.jobs.values():
             if job.component_jobs and job.route:
-                asm_stage = job.route[0]  # 조립 job의 첫 stage = 조립 stage
+                asm_stage = job.assembly_stage  # j_i^asm: job i의 조립 공정 (PPT 집합/인덱스)
                 asm_op_id = self.job_stage_to_op.get((job.job_id, asm_stage))
                 if asm_op_id is not None:
                     asm_op = self.operations[asm_op_id]
@@ -580,11 +580,13 @@ class FFSASchedulingEnv(gym.Env):
                 next_op.buffer_waiting = True
             else:
                 # ★ 단순 blocking: machine을 차단 상태로 유지
+                # current_op이 None인 경우에만 blocking (다른 job이 이미 점유 중이면 skip)
                 if op.machine_id is not None:
                     ms = self.machine_states[op.machine_id]
-                    ms.is_blocked = True
-                    ms.is_idle = False
-                    ms.blocked_job = job_id
+                    if ms.current_op is None and not ms.is_blocked:
+                        ms.is_blocked = True
+                        ms.is_idle = False
+                        ms.blocked_job = job_id
 
     def _check_and_enqueue_assembly_jobs(self):
         """[Fix #1] Assembly final job의 buffer 진입 조건을 매 이벤트 시점마다 확인.
@@ -612,9 +614,12 @@ class FFSASchedulingEnv(gym.Env):
                 continue
 
             # 조립 stage buffer에 공간이 있으면 진입
+            # PPT 제약식 10: WIP_asm 은 component 수 기준으로 카운트
             asm_stage = job.route[0]
             buf = self.buffers[asm_stage]
-            if buf.has_space():
+            n_comp = len(first_op.component_last_ops)
+            can_enter = (buf.capacity < 0) or (len(buf.queue) + n_comp <= buf.capacity)
+            if can_enter:
                 if job.job_id not in buf.queue:
                     buf.push(job.job_id)
                 first_op.buffer_waiting = True
@@ -793,7 +798,7 @@ class FFSASchedulingEnv(gym.Env):
             if op.is_processing and op.completion_time is not None:
                 t = max(t, op.completion_time)
                 continue
-            # 미시작 → 최소 처리시간 추가
+            # 미시작 → 최소 처리시간 + 최소 setup time 추가 (B안: optimistic estimate)
             compatible = [
                 mid for mid in self.instance.machines_by_stage.get(stage_id, [])
                 if job.product_id in self.instance.machines[mid].compatible_products
@@ -804,7 +809,14 @@ class FFSASchedulingEnv(gym.Env):
                     for mid in compatible
                 )
                 if min_proc < float('inf'):
-                    t += min_proc
+                    min_setup = min(
+                        (self.instance.setup_times.get((prev_p, job.product_id, stage_id, mid), 0.0)
+                         for prev_p in range(self.instance.num_products)
+                         if prev_p != job.product_id
+                         for mid in compatible),
+                        default=0.0
+                    ) if self.instance.setup_times else 0.0
+                    t += min_proc + min_setup
         return t
 
     def compute_product_clb(self, product_id: int) -> float:
