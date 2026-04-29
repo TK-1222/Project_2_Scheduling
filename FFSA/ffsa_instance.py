@@ -36,6 +36,7 @@ class InstanceConfig:
     use_assembly: bool = True
     use_setup: bool = True
     use_finite_buffer: bool = True
+    orders_per_product: List[int] = field(default_factory=lambda: [2, 3, 3, 2])  # 제품별 생산 수량
     seed: Optional[int] = 42
 
 
@@ -116,6 +117,9 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
     products: Dict[int, ProductData] = {}
     jobs: Dict[int, JobData] = {}
     jid = 0
+    oid = 0  # order_id 카운터
+
+    orders = config.orders_per_product
 
     for p in range(config.num_products):
         job_ids = []
