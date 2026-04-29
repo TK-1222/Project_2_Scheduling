@@ -122,7 +122,7 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
     jid = 0
     oid = 0  # order_id 카운터
 
-    orders = config.orders_per_product or [1] * config.num_products
+    orders = config.orders_per_product or [2] * config.num_products
 
     for p in range(config.num_products):
         for _ in range(orders[p]):
