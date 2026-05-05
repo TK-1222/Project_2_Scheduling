@@ -5,6 +5,11 @@ PPT Slide 13: 단계적 실험 전략
   Step 1: 단순 FFSA (assembly 없음)
   Step 2: Assembly 포함
   Step 3: Setup + Buffer
+
+학습 방식: Window 기반 Best-Trajectory 업데이트
+  - window_size 에피소드 동안 동일 정책으로 경험 수집 (정책 고정)
+  - window 종료 시 가장 낮은 WT를 기록한 에피소드의 trajectory로 1회 정책 업데이트
+  - 업데이트된 정책으로 다음 window 시작
 """
 
 import argparse
@@ -19,6 +24,7 @@ from ffsa_model import HGNNPolicy, PPOAgent
 def train(
     config: InstanceConfig,
     num_episodes: int = 500,
+    window_size: int = 30,
     device: str = "cpu",
     log_interval: int = 10,
 ):
@@ -26,11 +32,12 @@ def train(
     print(f"FFSA 스케줄링 RL 학습 시작")
     print(f"  제품 수: {config.num_products}")
     print(f"  Stage 수: {config.num_stages}")
-    print(f"  주문 수: {config.orders_per_product}")
+    print(f"  정규주문: {config.num_regular_orders}건")
+    print(f"  긴급주문: {config.num_urgent_orders}건")
     print(f"  Assembly: {config.use_assembly}")
     print(f"  Setup: {config.use_setup}")
     print(f"  유한 버퍼: {config.use_finite_buffer}")
-    print(f"  Episodes: {num_episodes}")
+    print(f"  Episodes: {num_episodes}  |  Window: {window_size}")
     print(f"  Device: {device}")
     print(f"{'='*60}")
 
@@ -54,7 +61,6 @@ def train(
         entropy_coeff=0.01,
         value_coeff=0.5,
         update_epochs=4,
-        target_update_interval=30,
         device=device,
     )
 
@@ -63,6 +69,11 @@ def train(
     episode_makespans = []
     episode_deadlocks = []
 
+    # window 내 (tardiness, trajectory) 누적
+    # trajectory = [(obs, action, log_prob, reward, value, done), ...]
+    window_buffer: list = []
+    metrics: dict = {}
+
     for ep in range(1, num_episodes + 1):
         obs, _ = env.reset()
         done = False
@@ -70,6 +81,7 @@ def train(
         steps = 0
         max_steps = env.num_operations * 10
         ep_deadlock = False
+        trajectory = []
 
         while not done and steps < max_steps:
             if not obs["actions"]:
@@ -78,7 +90,7 @@ def train(
             action, log_prob, value = agent.select_action(obs)
             next_obs, reward, done, truncated, info = env.step(action)
 
-            agent.store(obs, action, log_prob, reward, value, done or truncated)
+            trajectory.append((obs, action, log_prob, reward, value, done or truncated))
             total_reward += reward
             obs = next_obs
             steps += 1
@@ -87,17 +99,25 @@ def train(
                 ep_deadlock = True
                 break
 
-        metrics = agent.update()
-
         wt = env.get_actual_weighted_tardiness()
         ms = env.get_makespan()
-        agent.record_episode(wt)
+
         episode_rewards.append(total_reward)
         episode_tardiness.append(wt)
         episode_makespans.append(ms)
         episode_deadlocks.append(int(ep_deadlock))
+        window_buffer.append((wt, trajectory))
 
-        target_updated = (agent._episode_count % agent.target_update_interval == 0)
+        # window 종료: 최고 trajectory로 정책 업데이트
+        policy_updated = False
+        if ep % window_size == 0:
+            best_wt, best_traj = min(window_buffer, key=lambda x: x[0])
+            agent.buffer.clear()
+            for obs_t, act_t, lp_t, r_t, v_t, d_t in best_traj:
+                agent.buffer.store(obs_t, act_t, lp_t, r_t, v_t, d_t)
+            metrics = agent.update()
+            window_buffer = []
+            policy_updated = True
 
         if ep % log_interval == 0 or ep == 1:
             avg_r  = np.mean(episode_rewards[-log_interval:])
@@ -105,14 +125,14 @@ def train(
             avg_ms = np.mean(episode_makespans[-log_interval:])
             avg_dl = np.mean(episode_deadlocks[-log_interval:])
             loss_str = f"loss={metrics.get('loss', 0):.4f}" if metrics else "no update"
-            dl_str = f" | DL={avg_dl:.1f}" if avg_dl > 0 else ""
-            tgt_str = " | [TGT]" if target_updated else ""
+            dl_str  = f" | DL={avg_dl:.1f}" if avg_dl > 0 else ""
+            upd_str = " | [UPDATE]" if policy_updated else ""
             print(
                 f"[Ep {ep:4d}] steps={steps:4d} | "
                 f"reward={total_reward:8.2f} (avg={avg_r:8.2f}) | "
                 f"WT={wt:8.2f} (avg={avg_wt:8.2f}) | "
                 f"MS={ms:8.1f} (avg={avg_ms:8.1f}) | "
-                f"{loss_str}{dl_str}{tgt_str}"
+                f"{loss_str}{dl_str}{upd_str}"
             )
 
     print(f"\n{'='*60}")
@@ -164,7 +184,8 @@ def test_random_agent(config: InstanceConfig, num_episodes: int = 5):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FFSA 스케줄링 RL 학습")
     parser.add_argument("--step", type=int, default=1, choices=[1, 2, 3])
-    parser.add_argument("--episodes", type=int, default=100)
+    parser.add_argument("--episodes", type=int, default=300)
+    parser.add_argument("--window", type=int, default=30)
     parser.add_argument("--test-only", action="store_true")
     parser.add_argument("--products", type=int, default=4)
     parser.add_argument("--device", type=str, default="cpu")
@@ -181,4 +202,4 @@ if __name__ == "__main__":
         test_random_agent(config)
     else:
         test_random_agent(config, num_episodes=3)
-        train(config, num_episodes=args.episodes, device=args.device)
+        train(config, num_episodes=args.episodes, window_size=args.window, device=args.device)
