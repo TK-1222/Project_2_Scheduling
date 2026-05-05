@@ -24,7 +24,7 @@ from torch_geometric.data import HeteroData
 
 from ffsa_instance import (
     InstanceConfig, FFSAInstance, generate_instance,
-    ProductData, JobData, MachineData,
+    OrderData, ProductData, JobData, MachineData,
 )
 
 # Action 타입 정의
@@ -278,6 +278,11 @@ class FFSASchedulingEnv(gym.Env):
         self._deadlock_detected: bool = False
         self._prev_actual_wt: float = 0.0
 
+        # 긴급주문 실시간 생성용
+        self._urgent_rng: np.random.RandomState = np.random.RandomState()
+        self._urgent_orders_remaining: int = 0
+        self._next_urgent_arrival: float = float('inf')
+
     # ──────────────────────────────────────────────────────
     # Reset
     # ──────────────────────────────────────────────────────
@@ -287,11 +292,19 @@ class FFSASchedulingEnv(gym.Env):
         self.current_time = 0.0
         self._deadlock_detected = False
         self._prev_actual_wt = 0.0
+        # 인스턴스를 매 에피소드 새로 생성 (정규주문 랜덤 변경)
+        self.instance = generate_instance(self.config)
+        self.graph_builder = GraphBuilder(self.instance)
         self._init_operations()
         self._init_machines()
         self._init_buffers()
         self._init_assembly_pool()
         self._load_initial_jobs()
+        # 긴급주문 포아송 프로세스 초기화
+        rng_seed = None if self.config.seed is None else self.config.seed + id(self) % 10000
+        self._urgent_rng = np.random.RandomState(rng_seed)
+        self._urgent_orders_remaining = self.config.num_urgent_orders
+        self._next_urgent_arrival = self._sample_next_urgent_arrival()
         self.update_ready_operations()
         return self._get_obs(), {}
 
@@ -305,8 +318,10 @@ class FFSASchedulingEnv(gym.Env):
         for job in self.instance.jobs.values():
             self.job_ops[job.job_id] = []
             prev_op_id = None
-            # final job: 조립 대기 / 긴급주문 component: 도착 대기 → 둘 다 비활성
-            is_active = job.is_component and job.arrival_time == 0.0
+            # 활성 조건: t=0 도착이고, (component job이거나 assembly 없는 final job)
+            no_asm = not self.instance.config.use_assembly
+            is_active = (job.arrival_time == 0.0 and
+                         (job.is_component or (job.is_final_job and no_asm)))
 
             for stage_id in job.route:
                 is_asm = (job.is_final_job and stage_id == job.assembly_stage)
@@ -345,52 +360,170 @@ class FFSASchedulingEnv(gym.Env):
             self.buffers[sid] = BufferState(stage_id=sid, capacity=cap)
 
     def _init_assembly_pool(self):
-        """조립 버퍼 pool, 미활성 final job, 미도착 긴급주문 초기화"""
+        """조립 버퍼 pool 및 정규주문 final job 초기화 (긴급주문은 실시간 추가)"""
         self.assembly_pool = {p: {} for p in self.instance.products}
         self.inactive_final_jobs = {p: [] for p in self.instance.products}
-        # arrival_time → [job_id, ...] (component + final 모두 포함)
-        self.unreleased_jobs: Dict[float, List[int]] = {}
-
         for order in self.instance.orders.values():
-            if order.arrival_time > 0.0:
-                # 긴급주문: component + final 모두 도착 시점까지 대기
-                bucket = self.unreleased_jobs.setdefault(order.arrival_time, [])
-                bucket.extend(order.component_job_ids)
-                bucket.extend(order.final_job_ids)
-            else:
-                # 정규주문: final job만 조립 대기 큐에 등록
-                for fid in order.final_job_ids:
-                    self.inactive_final_jobs[order.product_id].append(fid)
+            for fid in order.final_job_ids:
+                self.inactive_final_jobs[order.product_id].append(fid)
 
     def _load_initial_jobs(self):
-        """정규주문 component job을 t=0에 stage 0 버퍼에 투입"""
+        """t=0 도착 job을 stage 0 버퍼에 투입 (component 또는 no-assembly final)"""
+        no_asm = not self.instance.config.use_assembly
         for job in self.instance.jobs.values():
-            if not job.is_component or not job.route:
+            if job.arrival_time != 0.0 or not job.route:
                 continue
-            if job.arrival_time > 0.0:
-                continue  # 긴급주문 → arrival_time에 활성화
+            if not (job.is_component or (job.is_final_job and no_asm)):
+                continue
             first_stage = job.route[0]
             self.buffers[first_stage].push(job.job_id)
             first_op_id = self.job_ops[job.job_id][0]
             self.operations[first_op_id].buffer_waiting = True
 
-    def _release_arrived_orders(self):
-        """current_time에 도착한 긴급주문 job 활성화"""
-        arrived = [t for t in self.unreleased_jobs if t <= self.current_time + 1e-9]
-        for t in arrived:
-            for jid in self.unreleased_jobs[t]:
-                job = self.instance.jobs[jid]
-                if job.is_component:
-                    for op_id in self.job_ops[jid]:
-                        self.operations[op_id].active = True
-                    if job.route:
-                        first_stage = job.route[0]
-                        self.buffers[first_stage].push(jid)
-                        self.operations[self.job_ops[jid][0]].buffer_waiting = True
-                elif job.is_final_job:
-                    # 조립 대기 큐로 이동 (assembly dispatch까지 비활성 유지)
-                    self.inactive_final_jobs[job.product_id].append(jid)
-            del self.unreleased_jobs[t]
+    def _sample_next_urgent_arrival(self) -> float:
+        """다음 긴급주문 도착 시점 샘플링 (포아송 프로세스)"""
+        if self._urgent_orders_remaining <= 0:
+            return float('inf')
+        inter = self._urgent_rng.exponential(self.config.urgent_inter_arrival_mean)
+        return self.current_time + inter
+
+    def _arrive_urgent_order(self):
+        """긴급주문 실시간 생성: 구성 결정 → job/op 생성 → 버퍼 투입"""
+        cfg = self.config
+        rng = self._urgent_rng
+        t = self.current_time
+
+        p = int(rng.randint(cfg.num_products))
+        qty = int(rng.randint(cfg.urgent_quantity_range[0], cfg.urgent_quantity_range[1] + 1))
+        due = t + float(rng.uniform(*cfg.urgent_due_date_offset_range))
+
+        new_oid = max(self.instance.orders.keys(), default=-1) + 1
+        order = OrderData(
+            order_id=new_oid, product_id=p, quantity=qty,
+            due_date=due, arrival_time=t, is_urgent=True,
+        )
+        self.instance.orders[new_oid] = order
+
+        stages = list(range(cfg.num_stages))
+        pre_asm = stages[:cfg.assembly_stage_idx]
+        post_asm = stages[cfg.assembly_stage_idx:]
+
+        new_jid = max(self.instance.jobs.keys(), default=-1) + 1
+        new_op_id = max(self.operations.keys(), default=-1) + 1
+
+        for unit_idx in range(qty):
+            if cfg.use_assembly:
+                # component jobs
+                for comp_type in range(cfg.components_per_product):
+                    job = JobData(
+                        job_id=new_jid, product_id=p, order_id=new_oid,
+                        arrival_time=t, route=list(pre_asm),
+                        is_component=True, component_type_idx=comp_type,
+                        order_unit_idx=unit_idx, due_date=due,
+                    )
+                    self.instance.jobs[new_jid] = job
+                    order.component_job_ids.append(new_jid)
+                    self.job_ops[new_jid] = []
+                    # 처리시간 생성
+                    for sid in pre_asm:
+                        for mid in self.instance.machines_by_stage[sid]:
+                            if p in self.instance.machines[mid].compatible_products:
+                                self.instance.processing_times[(new_jid, sid, mid)] = float(
+                                    rng.uniform(*cfg.processing_time_range)
+                                )
+                    # operations 생성 및 버퍼 투입
+                    prev_op = None
+                    for sid in pre_asm:
+                        op = OperationState(
+                            op_id=new_op_id, job_id=new_jid, product_id=p,
+                            stage_id=sid, predecessors=[prev_op] if prev_op is not None else [],
+                            active=True,
+                        )
+                        self.operations[new_op_id] = op
+                        self.job_ops[new_jid].append(new_op_id)
+                        self.op_to_job_stage[new_op_id] = (new_jid, sid)
+                        self.job_stage_to_op[(new_jid, sid)] = new_op_id
+                        prev_op = new_op_id
+                        new_op_id += 1
+                    # 첫 번째 op 버퍼에 투입
+                    first_op = self.job_ops[new_jid][0]
+                    self.buffers[pre_asm[0]].push(new_jid)
+                    self.operations[first_op].buffer_waiting = True
+                    new_jid += 1
+
+                # final job
+                fjob = JobData(
+                    job_id=new_jid, product_id=p, order_id=new_oid,
+                    arrival_time=t, route=list(post_asm),
+                    is_final_job=True, assembly_stage=cfg.assembly_stage_idx,
+                    order_unit_idx=unit_idx, due_date=due,
+                )
+                self.instance.jobs[new_jid] = fjob
+                order.final_job_ids.append(new_jid)
+                self.job_ops[new_jid] = []
+                for sid in post_asm:
+                    for mid in self.instance.machines_by_stage[sid]:
+                        if p in self.instance.machines[mid].compatible_products:
+                            self.instance.processing_times[(new_jid, sid, mid)] = float(
+                                rng.uniform(*cfg.processing_time_range)
+                            )
+                prev_op = None
+                for sid in post_asm:
+                    is_asm = (sid == cfg.assembly_stage_idx)
+                    op = OperationState(
+                        op_id=new_op_id, job_id=new_jid, product_id=p,
+                        stage_id=sid, is_assembly=is_asm,
+                        predecessors=[prev_op] if prev_op is not None else [],
+                        active=False,  # 조립 dispatch까지 비활성
+                    )
+                    self.operations[new_op_id] = op
+                    self.job_ops[new_jid].append(new_op_id)
+                    self.op_to_job_stage[new_op_id] = (new_jid, sid)
+                    self.job_stage_to_op[(new_jid, sid)] = new_op_id
+                    prev_op = new_op_id
+                    new_op_id += 1
+                self.inactive_final_jobs[p].append(new_jid)
+                new_jid += 1
+            else:
+                job = JobData(
+                    job_id=new_jid, product_id=p, order_id=new_oid,
+                    arrival_time=t, route=list(stages),
+                    is_final_job=True, order_unit_idx=unit_idx, due_date=due,
+                )
+                self.instance.jobs[new_jid] = job
+                order.final_job_ids.append(new_jid)
+                self.job_ops[new_jid] = []
+                for sid in stages:
+                    for mid in self.instance.machines_by_stage[sid]:
+                        if p in self.instance.machines[mid].compatible_products:
+                            self.instance.processing_times[(new_jid, sid, mid)] = float(
+                                rng.uniform(*cfg.processing_time_range)
+                            )
+                prev_op = None
+                for sid in stages:
+                    op = OperationState(
+                        op_id=new_op_id, job_id=new_jid, product_id=p,
+                        stage_id=sid, predecessors=[prev_op] if prev_op is not None else [],
+                        active=True,
+                    )
+                    self.operations[new_op_id] = op
+                    self.job_ops[new_jid].append(new_op_id)
+                    self.op_to_job_stage[new_op_id] = (new_jid, sid)
+                    self.job_stage_to_op[(new_jid, sid)] = new_op_id
+                    prev_op = new_op_id
+                    new_op_id += 1
+                first_op = self.job_ops[new_jid][0]
+                self.buffers[stages[0]].push(new_jid)
+                self.operations[first_op].buffer_waiting = True
+                new_jid += 1
+
+        # GraphBuilder max_due 갱신
+        if due > self.graph_builder.max_due:
+            self.graph_builder.max_due = due
+
+        self.num_operations = new_op_id
+        self._urgent_orders_remaining -= 1
+        self._next_urgent_arrival = self._sample_next_urgent_arrival()
 
     # ──────────────────────────────────────────────────────
     # Step
@@ -502,14 +635,13 @@ class FFSASchedulingEnv(gym.Env):
 
     def _advance_until_next_decision_point(self):
         while True:
-            self._release_arrived_orders()
             self.update_ready_operations()
             if self._has_valid_action():
                 break
 
             processing = [op for op in self.operations.values()
                           if op.active and op.is_processing]
-            next_arrival = min(self.unreleased_jobs.keys(), default=float('inf'))
+            next_arrival = self._next_urgent_arrival
 
             if not processing and next_arrival == float('inf'):
                 blocked = [ms for ms in self.machine_states.values() if ms.is_blocked]
@@ -531,6 +663,9 @@ class FFSASchedulingEnv(gym.Env):
             self._complete_operations_at(next_time)
             self._move_completed_to_next_buffer()
             self._update_machine_remaining()
+
+            if self.current_time >= self._next_urgent_arrival - 1e-9:
+                self._arrive_urgent_order()
 
     def _complete_operations_at(self, t: float):
         for op in self.operations.values():
@@ -791,7 +926,7 @@ class FFSASchedulingEnv(gym.Env):
 
     def _check_done(self) -> bool:
         """미도착 긴급주문이 없고, 모든 final job이 완료되면 종료"""
-        if self.unreleased_jobs:
+        if self._urgent_orders_remaining > 0:
             return False
         for order in self.instance.orders.values():
             for fid in order.final_job_ids:

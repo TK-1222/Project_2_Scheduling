@@ -41,10 +41,10 @@ class InstanceConfig:
     num_regular_orders: int = 4
     regular_quantity_range: Tuple[int, int] = (1, 3)
     regular_due_date_range: Tuple[float, float] = (150.0, 400.0)
-    # 긴급주문 (t>0 도착)
-    num_urgent_orders: int = 2
+    # 긴급주문 (포아송 프로세스, 실시간 생성)
+    num_urgent_orders: int = 2                              # 에피소드당 최대 긴급주문 수
+    urgent_inter_arrival_mean: float = 80.0                # 평균 도착 간격 (1/λ)
     urgent_quantity_range: Tuple[int, int] = (1, 2)
-    urgent_arrival_range: Tuple[float, float] = (30.0, 150.0)
     urgent_due_date_offset_range: Tuple[float, float] = (20.0, 60.0)  # arrival + offset
 
 
@@ -159,17 +159,7 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
         )
         oid += 1
 
-    for _ in range(config.num_urgent_orders):
-        p = int(rng.randint(config.num_products))
-        qty = int(rng.randint(config.urgent_quantity_range[0],
-                               config.urgent_quantity_range[1] + 1))
-        arrival = float(rng.uniform(*config.urgent_arrival_range))
-        due = arrival + float(rng.uniform(*config.urgent_due_date_offset_range))
-        orders[oid] = OrderData(
-            order_id=oid, product_id=p, quantity=qty,
-            due_date=due, arrival_time=arrival, is_urgent=True,
-        )
-        oid += 1
+    # 긴급주문은 에피소드 진행 중 환경에서 실시간 생성 (포아송 프로세스)
 
     # ── Job 생성 (주문 → unit → component/final) ──
     jobs: Dict[int, JobData] = {}
