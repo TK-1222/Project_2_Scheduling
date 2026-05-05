@@ -13,6 +13,7 @@ PPT Slide 13: PPO 하이퍼파라미터
   entropy=0.01, vf=0.5, lr=2e-4, epochs=3~5
 """
 
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -89,9 +90,9 @@ class HGNNPolicy(nn.Module):
             nn.Linear(64, 1),
         )
 
-        # Policy Head — 조립 action: (comp_A ‖ comp_B ‖ machine ‖ graph) = 4d
+        # Policy Head — 조립 action: (comp_A ‖ comp_B ‖ machine ‖ graph) = 3d + 2d
         self.policy_asm_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 4, mlp_hidden),
+            nn.Linear(hidden_dim * 5, mlp_hidden),
             nn.ELU(),
             nn.Linear(mlp_hidden, 64),
             nn.ELU(),
@@ -326,9 +327,14 @@ class PPOAgent:
         value_coeff: float = 0.5,
         update_epochs: int = 4,
         max_grad_norm: float = 0.5,
+        target_update_interval: int = 30,
         device: str = "cpu",
     ):
         self.policy = policy.to(device)
+        self.target_policy = copy.deepcopy(policy).to(device)
+        for p in self.target_policy.parameters():
+            p.requires_grad = False
+
         self.optimizer = torch.optim.Adam(policy.parameters(), lr=lr)
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -337,8 +343,24 @@ class PPOAgent:
         self.value_coeff = value_coeff
         self.update_epochs = update_epochs
         self.max_grad_norm = max_grad_norm
+        self.target_update_interval = target_update_interval
         self.device = device
         self.buffer = RolloutBuffer()
+
+        self._episode_count = 0
+        self._best_tardiness = float('inf')
+        self._best_policy_state = copy.deepcopy(policy.state_dict())
+
+    def record_episode(self, tardiness: float):
+        """에피소드 종료 시 호출: 최적 정책 추적 및 주기적 Target Network 갱신"""
+        self._episode_count += 1
+        if tardiness < self._best_tardiness:
+            self._best_tardiness = tardiness
+            self._best_policy_state = copy.deepcopy(self.policy.state_dict())
+
+        if self._episode_count % self.target_update_interval == 0:
+            self.target_policy.load_state_dict(self._best_policy_state)
+            self._best_tardiness = float('inf')  # 다음 주기 리셋
 
     def _obs_to_forward_args(self, obs: dict):
         graph = obs["graph"]
@@ -377,7 +399,8 @@ class PPOAgent:
 
         last_obs = self.buffer.observations[-1]
         with torch.no_grad():
-            _, last_val = self.policy(*self._obs_to_forward_args(last_obs))
+            # Target Network으로 안정적인 value target 계산
+            _, last_val = self.target_policy(*self._obs_to_forward_args(last_obs))
             last_value = last_val.item() if not self.buffer.dones[-1] else 0.0
 
         returns, advantages = self.buffer.compute_returns_and_advantages(
