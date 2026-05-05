@@ -30,7 +30,7 @@ class InstanceConfig:
     processing_time_range: Tuple[float, float] = (5.0, 40.0)
     setup_time_range: Tuple[float, float] = (2.0, 10.0)
     buffer_capacity: int = 10
-    due_date_tightness_range: Tuple[float, float] = (1.2, 2.0)  # 분포로 납기 설정
+    due_date_range: Tuple[float, float] = (100.0, 400.0)  # 주문별 납기 절대값 범위
     weight_range: Tuple[float, float] = (1.0, 5.0)
     machine_product_compatibility: float = 1.0
     use_assembly: bool = True
@@ -226,14 +226,10 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
         else:
             buffer_capacities[sid] = config.buffer_capacity if config.use_finite_buffer else -1
 
-    # ── 납기 (dp): tightness 분포로 주문별 독립 설정 ──
-    for p, prod in products.items():
-        base_time = _estimate_min_completion_time(
-            prod, jobs, machines, machines_by_stage, processing_times, config
-        )
+    # ── 납기 (dp): 주문 입력 시 주어지는 값으로 모델링 (절대값 범위에서 독립 샘플) ──
+    for prod in products.values():
         for fid in prod.final_job_ids:
-            tightness = float(rng.uniform(*config.due_date_tightness_range))
-            jobs[fid].due_date = base_time * tightness
+            jobs[fid].due_date = float(rng.uniform(*config.due_date_range))
 
     return FFSAInstance(
         config=config,
@@ -250,54 +246,6 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
         buffer_capacities=buffer_capacities,
     )
 
-
-def _estimate_min_completion_time(
-    product: ProductData,
-    jobs: Dict[int, JobData],
-    machines: Dict[int, MachineData],
-    machines_by_stage: Dict[int, List[int]],
-    processing_times: Dict[Tuple[int, int, int], float],
-    config: InstanceConfig,
-) -> float:
-    """납기 기준값 추정: 가장 오래 걸리는 component 타입 + final job 최소 처리시간"""
-    comp_time = 0.0
-    if config.use_assembly and product.component_job_ids:
-        type_times: Dict[int, float] = {}
-        for jid in product.component_job_ids:
-            j = jobs[jid]
-            t = j.component_type_idx
-            if t not in type_times:
-                type_times[t] = _job_min_proc_time(jid, j, machines_by_stage, machines, processing_times)
-        comp_time = max(type_times.values()) if type_times else 0.0
-
-    final_time = 0.0
-    if product.final_job_ids:
-        fid = product.final_job_ids[0]
-        fj = jobs[fid]
-        final_time = _job_min_proc_time(fid, fj, machines_by_stage, machines, processing_times)
-
-    return comp_time + final_time
-
-
-def _job_min_proc_time(
-    job_id: int,
-    job: JobData,
-    machines_by_stage: Dict[int, List[int]],
-    machines: Dict[int, MachineData],
-    processing_times: Dict[Tuple[int, int, int], float],
-) -> float:
-    total = 0.0
-    for sid in job.route:
-        compat = [m for m in machines_by_stage[sid]
-                  if job.product_id in machines[m].compatible_products]
-        if compat:
-            min_proc = min(
-                processing_times.get((job_id, sid, m), float('inf'))
-                for m in compat
-            )
-            if min_proc < float('inf'):
-                total += min_proc
-    return total
 
 
 # ──────────────────────────────────────────────────────────

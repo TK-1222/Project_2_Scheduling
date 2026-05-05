@@ -54,6 +54,7 @@ def train(
         entropy_coeff=0.01,
         value_coeff=0.5,
         update_epochs=4,
+        target_update_interval=30,
         device=device,
     )
 
@@ -90,10 +91,13 @@ def train(
 
         wt = env.get_actual_weighted_tardiness()
         ms = env.get_makespan()
+        agent.record_episode(wt)
         episode_rewards.append(total_reward)
         episode_tardiness.append(wt)
         episode_makespans.append(ms)
         episode_deadlocks.append(int(ep_deadlock))
+
+        target_updated = (agent._episode_count % agent.target_update_interval == 0)
 
         if ep % log_interval == 0 or ep == 1:
             avg_r  = np.mean(episode_rewards[-log_interval:])
@@ -102,12 +106,13 @@ def train(
             avg_dl = np.mean(episode_deadlocks[-log_interval:])
             loss_str = f"loss={metrics.get('loss', 0):.4f}" if metrics else "no update"
             dl_str = f" | DL={avg_dl:.1f}" if avg_dl > 0 else ""
+            tgt_str = " | [TGT]" if target_updated else ""
             print(
                 f"[Ep {ep:4d}] steps={steps:4d} | "
                 f"reward={total_reward:8.2f} (avg={avg_r:8.2f}) | "
                 f"WT={wt:8.2f} (avg={avg_wt:8.2f}) | "
                 f"MS={ms:8.1f} (avg={avg_ms:8.1f}) | "
-                f"{loss_str}{dl_str}"
+                f"{loss_str}{dl_str}{tgt_str}"
             )
 
     print(f"\n{'='*60}")
