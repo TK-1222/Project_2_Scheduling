@@ -208,11 +208,11 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
                     order_id=order.order_id,
                     arrival_time=order.arrival_time,
                     route=list(stages),
-                    is_final_job=True,
+                    is_final_job=False,   # assembly 없을 때는 final job 개념 없음
                     order_unit_idx=unit_idx,
                     due_date=order.due_date,
                 )
-                order.final_job_ids.append(jid)
+                order.final_job_ids.append(jid)  # 완료 추적용 리스트는 유지
                 jid += 1
 
     num_jobs = jid

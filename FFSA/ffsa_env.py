@@ -107,8 +107,8 @@ class GraphBuilder:
         self.max_proc = max(instance.processing_times.values()) if instance.processing_times else 1.0
         self.max_setup = max(instance.setup_times.values()) if instance.setup_times else 1.0
         self.max_due = max(
-            jobs.due_date for jobs in instance.jobs.values() if jobs.is_final_job
-        ) if any(j.is_final_job for j in instance.jobs.values()) else 1.0
+            (j.due_date for j in instance.jobs.values() if j.due_date > 0), default=1.0
+        )
         self.max_weight = max(p.weight for p in instance.products.values()) if instance.products else 1.0
 
     def build(self, env: "FFSASchedulingEnv") -> HeteroData:
@@ -163,8 +163,7 @@ class GraphBuilder:
             feats[idx, 6] = op.stage_id / max(self.inst.num_stages - 1, 1)
             feats[idx, 7] = op.product_id / max(self.inst.num_products - 1, 1)
             job = self.inst.jobs[op.job_id]
-            if job.is_final_job:
-                feats[idx, 8] = job.due_date / self.max_due if self.max_due > 0 else 0.0
+            feats[idx, 8] = job.due_date / self.max_due if self.max_due > 0 else 0.0
             feats[idx, 9] = self.inst.products[op.product_id].weight / self.max_weight if self.max_weight > 0 else 0.0
 
         return torch.tensor(feats)
@@ -318,10 +317,8 @@ class FFSASchedulingEnv(gym.Env):
         for job in self.instance.jobs.values():
             self.job_ops[job.job_id] = []
             prev_op_id = None
-            # 활성 조건: t=0 도착이고, (component job이거나 assembly 없는 final job)
-            no_asm = not self.instance.config.use_assembly
-            is_active = (job.arrival_time == 0.0 and
-                         (job.is_component or (job.is_final_job and no_asm)))
+            # 활성 조건: t=0 도착이고, final job이 아닌 경우 (component 또는 no-assembly job)
+            is_active = job.arrival_time == 0.0 and not job.is_final_job
 
             for stage_id in job.route:
                 is_asm = (job.is_final_job and stage_id == job.assembly_stage)
@@ -363,17 +360,16 @@ class FFSASchedulingEnv(gym.Env):
         """조립 버퍼 pool 및 정규주문 final job 초기화 (긴급주문은 실시간 추가)"""
         self.assembly_pool = {p: {} for p in self.instance.products}
         self.inactive_final_jobs = {p: [] for p in self.instance.products}
+        if not self.config.use_assembly:
+            return
         for order in self.instance.orders.values():
             for fid in order.final_job_ids:
                 self.inactive_final_jobs[order.product_id].append(fid)
 
     def _load_initial_jobs(self):
-        """t=0 도착 job을 stage 0 버퍼에 투입 (component 또는 no-assembly final)"""
-        no_asm = not self.instance.config.use_assembly
+        """t=0 도착 job을 stage 0 버퍼에 투입 (final job 제외: 조립 dispatch 전까지 비활성)"""
         for job in self.instance.jobs.values():
-            if job.arrival_time != 0.0 or not job.route:
-                continue
-            if not (job.is_component or (job.is_final_job and no_asm)):
+            if job.arrival_time != 0.0 or not job.route or job.is_final_job:
                 continue
             first_stage = job.route[0]
             self.buffers[first_stage].push(job.job_id)
@@ -488,7 +484,7 @@ class FFSASchedulingEnv(gym.Env):
                 job = JobData(
                     job_id=new_jid, product_id=p, order_id=new_oid,
                     arrival_time=t, route=list(stages),
-                    is_final_job=True, order_unit_idx=unit_idx, due_date=due,
+                    is_final_job=False, order_unit_idx=unit_idx, due_date=due,
                 )
                 self.instance.jobs[new_jid] = job
                 order.final_job_ids.append(new_jid)
