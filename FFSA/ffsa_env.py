@@ -305,7 +305,8 @@ class FFSASchedulingEnv(gym.Env):
         for job in self.instance.jobs.values():
             self.job_ops[job.job_id] = []
             prev_op_id = None
-            is_active = job.is_component or not job.is_final_job  # final job은 비활성으로 시작
+            # final job: 조립 대기 / 긴급주문 component: 도착 대기 → 둘 다 비활성
+            is_active = job.is_component and job.arrival_time == 0.0
 
             for stage_id in job.route:
                 is_asm = (job.is_final_job and stage_id == job.assembly_stage)
@@ -344,23 +345,52 @@ class FFSASchedulingEnv(gym.Env):
             self.buffers[sid] = BufferState(stage_id=sid, capacity=cap)
 
     def _init_assembly_pool(self):
-        """조립 버퍼 pool 및 미활성 final job 초기화"""
+        """조립 버퍼 pool, 미활성 final job, 미도착 긴급주문 초기화"""
         self.assembly_pool = {p: {} for p in self.instance.products}
         self.inactive_final_jobs = {p: [] for p in self.instance.products}
+        # arrival_time → [job_id, ...] (component + final 모두 포함)
+        self.unreleased_jobs: Dict[float, List[int]] = {}
 
-        for job in self.instance.jobs.values():
-            if job.is_final_job:
-                self.inactive_final_jobs[job.product_id].append(job.job_id)
+        for order in self.instance.orders.values():
+            if order.arrival_time > 0.0:
+                # 긴급주문: component + final 모두 도착 시점까지 대기
+                bucket = self.unreleased_jobs.setdefault(order.arrival_time, [])
+                bucket.extend(order.component_job_ids)
+                bucket.extend(order.final_job_ids)
+            else:
+                # 정규주문: final job만 조립 대기 큐에 등록
+                for fid in order.final_job_ids:
+                    self.inactive_final_jobs[order.product_id].append(fid)
 
     def _load_initial_jobs(self):
-        """component job의 첫 op을 해당 stage 버퍼에 투입 (t=0)"""
+        """정규주문 component job을 t=0에 stage 0 버퍼에 투입"""
         for job in self.instance.jobs.values():
             if not job.is_component or not job.route:
                 continue
+            if job.arrival_time > 0.0:
+                continue  # 긴급주문 → arrival_time에 활성화
             first_stage = job.route[0]
             self.buffers[first_stage].push(job.job_id)
             first_op_id = self.job_ops[job.job_id][0]
             self.operations[first_op_id].buffer_waiting = True
+
+    def _release_arrived_orders(self):
+        """current_time에 도착한 긴급주문 job 활성화"""
+        arrived = [t for t in self.unreleased_jobs if t <= self.current_time + 1e-9]
+        for t in arrived:
+            for jid in self.unreleased_jobs[t]:
+                job = self.instance.jobs[jid]
+                if job.is_component:
+                    for op_id in self.job_ops[jid]:
+                        self.operations[op_id].active = True
+                    if job.route:
+                        first_stage = job.route[0]
+                        self.buffers[first_stage].push(jid)
+                        self.operations[self.job_ops[jid][0]].buffer_waiting = True
+                elif job.is_final_job:
+                    # 조립 대기 큐로 이동 (assembly dispatch까지 비활성 유지)
+                    self.inactive_final_jobs[job.product_id].append(jid)
+            del self.unreleased_jobs[t]
 
     # ──────────────────────────────────────────────────────
     # Step
@@ -472,19 +502,25 @@ class FFSASchedulingEnv(gym.Env):
 
     def _advance_until_next_decision_point(self):
         while True:
+            self._release_arrived_orders()
             self.update_ready_operations()
             if self._has_valid_action():
                 break
 
             processing = [op for op in self.operations.values()
                           if op.active and op.is_processing]
-            if not processing:
+            next_arrival = min(self.unreleased_jobs.keys(), default=float('inf'))
+
+            if not processing and next_arrival == float('inf'):
                 blocked = [ms for ms in self.machine_states.values() if ms.is_blocked]
                 if blocked:
                     self._deadlock_detected = True
                 break
 
-            next_time = min(op.completion_time for op in processing)
+            next_completion = min(
+                (op.completion_time for op in processing), default=float('inf')
+            )
+            next_time = min(next_completion, next_arrival)
             dt = next_time - self.current_time
 
             for ms in self.machine_states.values():
@@ -735,18 +771,18 @@ class FFSASchedulingEnv(gym.Env):
         return -delta
 
     def _compute_actual_weighted_tardiness(self) -> float:
-        """완료된 final job에 대해서만 실제 tardiness 합산"""
+        """완료된 final job에 대해 주문 납기 기준 tardiness 합산"""
         total = 0.0
-        for prod in self.instance.products.values():
-            for fid in prod.final_job_ids:
+        for order in self.instance.orders.values():
+            weight = self.instance.products[order.product_id].weight
+            for fid in order.final_job_ids:
                 op_list = self.job_ops[fid]
                 if not op_list:
                     continue
                 last_op = self.operations[op_list[-1]]
                 if last_op.active and last_op.is_done and last_op.completion_time is not None:
-                    due = self.instance.jobs[fid].due_date
-                    tp = max(0.0, last_op.completion_time - due)
-                    total += prod.weight * tp
+                    tp = max(0.0, last_op.completion_time - order.due_date)
+                    total += weight * tp
         return total
 
     # ──────────────────────────────────────────────────────
@@ -754,9 +790,11 @@ class FFSASchedulingEnv(gym.Env):
     # ──────────────────────────────────────────────────────
 
     def _check_done(self) -> bool:
-        """모든 final job이 완료되면 종료"""
-        for prod in self.instance.products.values():
-            for fid in prod.final_job_ids:
+        """미도착 긴급주문이 없고, 모든 final job이 완료되면 종료"""
+        if self.unreleased_jobs:
+            return False
+        for order in self.instance.orders.values():
+            for fid in order.final_job_ids:
                 op_list = self.job_ops[fid]
                 if not op_list:
                     return False

@@ -4,14 +4,15 @@ FFSA 인스턴스 생성기
 PPT 02장: 집합/인덱스 (P, I, J, K, Ip, Ji, Kj)
 PPT 03장: 파라미터 (pijk, siijk, dp, wp, Bj, epk)
 
-단계적 실험 전략 (PPT Slide 13):
-  Step 1: simple  — assembly 없음, setup 없음, 무한 버퍼
-  Step 2: assembly — assembly 추가
-  Step 3: full    — setup + 유한 버퍼 추가
+주문 모델:
+  - 정규주문: t=0 도착, 제품 종류·수량·납기 지정
+  - 긴급주문: t>0 랜덤 도착, 짧은 납기
+  - 주문 내 unit들은 납기 공유
+  - Job = 조립 전 구성품 하나 (에이전트가 개별 의사결정)
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 
@@ -23,21 +24,28 @@ import numpy as np
 class InstanceConfig:
     """FFSA 인스턴스 생성 설정"""
     num_products: int = 4
-    components_per_product: int = 2      # 조립 시 component 타입 수
+    components_per_product: int = 2
     num_stages: int = 6
-    assembly_stage_idx: int = 3          # 조립 stage 인덱스 (0-based)
+    assembly_stage_idx: int = 3
     machines_per_stage: Optional[List[int]] = field(default_factory=lambda: [2, 2, 2, 2, 2, 2])
     processing_time_range: Tuple[float, float] = (5.0, 40.0)
     setup_time_range: Tuple[float, float] = (2.0, 10.0)
     buffer_capacity: int = 10
-    due_date_range: Tuple[float, float] = (100.0, 400.0)  # 주문별 납기 절대값 범위
     weight_range: Tuple[float, float] = (1.0, 5.0)
     machine_product_compatibility: float = 1.0
     use_assembly: bool = True
     use_setup: bool = True
     use_finite_buffer: bool = True
-    orders_per_product: List[int] = field(default_factory=lambda: [2, 3, 3, 2])
     seed: Optional[int] = 42
+    # 정규주문 (t=0 도착)
+    num_regular_orders: int = 4
+    regular_quantity_range: Tuple[int, int] = (1, 3)
+    regular_due_date_range: Tuple[float, float] = (150.0, 400.0)
+    # 긴급주문 (t>0 도착)
+    num_urgent_orders: int = 2
+    urgent_quantity_range: Tuple[int, int] = (1, 2)
+    urgent_arrival_range: Tuple[float, float] = (30.0, 150.0)
+    urgent_due_date_offset_range: Tuple[float, float] = (20.0, 60.0)  # arrival + offset
 
 
 # ──────────────────────────────────────────────────────────
@@ -45,26 +53,39 @@ class InstanceConfig:
 # ──────────────────────────────────────────────────────────
 
 @dataclass
+class OrderData:
+    """주문 정보: 어떤 제품을 몇 개, 언제까지, 언제 도착"""
+    order_id: int
+    product_id: int
+    quantity: int
+    due_date: float
+    arrival_time: float        # 0 = 정규주문, >0 = 긴급주문
+    is_urgent: bool = False
+    component_job_ids: List[int] = field(default_factory=list)
+    final_job_ids: List[int] = field(default_factory=list)
+
+
+@dataclass
 class ProductData:
     """제품 정보 (PPT: p ∈ P)"""
     product_id: int
-    weight: float                        # wp
-    component_job_ids: List[int] = field(default_factory=list)  # 전체 component job id 목록
-    final_job_ids: List[int] = field(default_factory=list)      # 주문별 final job id 목록
+    weight: float              # wp (tardiness 가중치)
 
 
 @dataclass
 class JobData:
-    """Job 정보 (PPT: i ∈ I)"""
+    """Job 정보: 조립 전 구성품 하나 또는 final job"""
     job_id: int
     product_id: int
+    order_id: int
+    arrival_time: float        # 주문 도착 시점 상속
     route: List[int] = field(default_factory=list)
     is_component: bool = False
-    component_type_idx: int = 0          # 같은 제품 내 component 타입 (0=A, 1=B, ...)
+    component_type_idx: int = 0
     is_final_job: bool = False
-    assembly_stage: Optional[int] = None  # final job의 조립 시작 stage
-    order_idx: int = 0                   # 제품 내 주문 번호
-    due_date: float = 0.0                # dp (주문별 납기)
+    assembly_stage: Optional[int] = None
+    order_unit_idx: int = 0    # 주문 내 몇 번째 unit인지
+    due_date: float = 0.0      # 주문 납기 상속
 
 
 @dataclass
@@ -80,6 +101,7 @@ class FFSAInstance:
     """생성된 FFSA 인스턴스"""
     config: InstanceConfig
     products: Dict[int, ProductData]
+    orders: Dict[int, OrderData]
     jobs: Dict[int, JobData]
     machines: Dict[int, MachineData]
     num_stages: int
@@ -87,9 +109,9 @@ class FFSAInstance:
     num_jobs: int
     num_machines: int
     machines_by_stage: Dict[int, List[int]]
-    processing_times: Dict[Tuple[int, int, int], float]         # (job, stage, machine) → pijk
-    setup_times: Dict[Tuple[int, int, int, int], float]         # (prod_from, prod_to, stage, machine) → siijk
-    buffer_capacities: Dict[int, int]                           # stage_id → Bj (-1=무한)
+    processing_times: Dict[Tuple[int, int, int], float]
+    setup_times: Dict[Tuple[int, int, int, int], float]
+    buffer_capacities: Dict[int, int]
 
 
 # ──────────────────────────────────────────────────────────
@@ -97,17 +119,10 @@ class FFSAInstance:
 # ──────────────────────────────────────────────────────────
 
 def generate_instance(config: InstanceConfig) -> FFSAInstance:
-    """PPT의 집합/인덱스/파라미터를 랜덤으로 생성"""
     rng = np.random.RandomState(config.seed)
 
     stages = list(range(config.num_stages))
     mps = config.machines_per_stage or [2] * config.num_stages
-
-    # orders_per_product 길이 보정
-    orders = list(config.orders_per_product)
-    while len(orders) < config.num_products:
-        orders.append(1)
-    orders = orders[:config.num_products]
 
     # ── 기계 생성 ──
     machines: Dict[int, MachineData] = {}
@@ -121,58 +136,93 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
             mid += 1
     num_machines = mid
 
-    # ── 제품/Job 생성 ──
+    # ── 제품 생성 ──
     products: Dict[int, ProductData] = {}
-    jobs: Dict[int, JobData] = {}
-    jid = 0
-
     for p in range(config.num_products):
-        prod = ProductData(
+        products[p] = ProductData(
             product_id=p,
             weight=float(rng.uniform(*config.weight_range)),
         )
-        products[p] = prod
 
-        if config.use_assembly:
-            pre_asm = stages[:config.assembly_stage_idx]
-            post_asm = stages[config.assembly_stage_idx:]
+    # ── 주문 생성 ──
+    orders: Dict[int, OrderData] = {}
+    oid = 0
 
-            for order_idx in range(orders[p]):
-                # component jobs: 타입별 1개씩
+    for _ in range(config.num_regular_orders):
+        p = int(rng.randint(config.num_products))
+        qty = int(rng.randint(config.regular_quantity_range[0],
+                               config.regular_quantity_range[1] + 1))
+        due = float(rng.uniform(*config.regular_due_date_range))
+        orders[oid] = OrderData(
+            order_id=oid, product_id=p, quantity=qty,
+            due_date=due, arrival_time=0.0, is_urgent=False,
+        )
+        oid += 1
+
+    for _ in range(config.num_urgent_orders):
+        p = int(rng.randint(config.num_products))
+        qty = int(rng.randint(config.urgent_quantity_range[0],
+                               config.urgent_quantity_range[1] + 1))
+        arrival = float(rng.uniform(*config.urgent_arrival_range))
+        due = arrival + float(rng.uniform(*config.urgent_due_date_offset_range))
+        orders[oid] = OrderData(
+            order_id=oid, product_id=p, quantity=qty,
+            due_date=due, arrival_time=arrival, is_urgent=True,
+        )
+        oid += 1
+
+    # ── Job 생성 (주문 → unit → component/final) ──
+    jobs: Dict[int, JobData] = {}
+    jid = 0
+
+    if config.use_assembly:
+        pre_asm = stages[:config.assembly_stage_idx]
+        post_asm = stages[config.assembly_stage_idx:]
+
+        for order in orders.values():
+            for unit_idx in range(order.quantity):
                 for comp_type in range(config.components_per_product):
                     jobs[jid] = JobData(
                         job_id=jid,
-                        product_id=p,
+                        product_id=order.product_id,
+                        order_id=order.order_id,
+                        arrival_time=order.arrival_time,
                         route=list(pre_asm),
                         is_component=True,
                         component_type_idx=comp_type,
-                        order_idx=order_idx,
+                        order_unit_idx=unit_idx,
+                        due_date=order.due_date,
                     )
-                    prod.component_job_ids.append(jid)
+                    order.component_job_ids.append(jid)
                     jid += 1
 
-                # final job: 조립 포함 이후 공정
                 jobs[jid] = JobData(
                     job_id=jid,
-                    product_id=p,
+                    product_id=order.product_id,
+                    order_id=order.order_id,
+                    arrival_time=order.arrival_time,
                     route=list(post_asm),
                     is_final_job=True,
                     assembly_stage=config.assembly_stage_idx,
-                    order_idx=order_idx,
+                    order_unit_idx=unit_idx,
+                    due_date=order.due_date,
                 )
-                prod.final_job_ids.append(jid)
+                order.final_job_ids.append(jid)
                 jid += 1
-        else:
-            # 조립 없음: 주문별 1개 job, 모든 stage 통과
-            for order_idx in range(orders[p]):
+    else:
+        for order in orders.values():
+            for unit_idx in range(order.quantity):
                 jobs[jid] = JobData(
                     job_id=jid,
-                    product_id=p,
+                    product_id=order.product_id,
+                    order_id=order.order_id,
+                    arrival_time=order.arrival_time,
                     route=list(stages),
                     is_final_job=True,
-                    order_idx=order_idx,
+                    order_unit_idx=unit_idx,
+                    due_date=order.due_date,
                 )
-                prod.final_job_ids.append(jid)
+                order.final_job_ids.append(jid)
                 jid += 1
 
     num_jobs = jid
@@ -185,7 +235,6 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
         if not m.compatible_products:
             m.compatible_products.append(int(rng.randint(config.num_products)))
 
-    # 모든 (job, stage) 조합에 최소 1개 호환 기계 보장
     for j in jobs.values():
         for sid in j.route:
             compat = [m for m in machines_by_stage[sid]
@@ -195,7 +244,7 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
                 if j.product_id not in machines[forced].compatible_products:
                     machines[forced].compatible_products.append(j.product_id)
 
-    # ── 처리시간 (pijk) ──
+    # ── 처리시간 ──
     processing_times: Dict[Tuple[int, int, int], float] = {}
     for j in jobs.values():
         for sid in j.route:
@@ -205,7 +254,7 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
                         rng.uniform(*config.processing_time_range)
                     )
 
-    # ── Setup time (siijk) ──
+    # ── Setup time ──
     setup_times: Dict[Tuple[int, int, int, int], float] = {}
     if config.use_setup:
         for pf in range(config.num_products):
@@ -222,18 +271,14 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
     buffer_capacities: Dict[int, int] = {}
     for sid in stages:
         if sid == stages[0]:
-            buffer_capacities[sid] = -1  # 첫 stage 전 버퍼: 무한
+            buffer_capacities[sid] = -1
         else:
             buffer_capacities[sid] = config.buffer_capacity if config.use_finite_buffer else -1
-
-    # ── 납기 (dp): 주문 입력 시 주어지는 값으로 모델링 (절대값 범위에서 독립 샘플) ──
-    for prod in products.values():
-        for fid in prod.final_job_ids:
-            jobs[fid].due_date = float(rng.uniform(*config.due_date_range))
 
     return FFSAInstance(
         config=config,
         products=products,
+        orders=orders,
         jobs=jobs,
         machines=machines,
         num_stages=config.num_stages,
@@ -247,7 +292,6 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
     )
 
 
-
 # ──────────────────────────────────────────────────────────
 # Preset 설정
 # ──────────────────────────────────────────────────────────
@@ -257,6 +301,7 @@ def simple_config(**kwargs) -> InstanceConfig:
     defaults = dict(
         num_stages=4, machines_per_stage=[2, 2, 2, 2],
         use_assembly=False, use_setup=False, use_finite_buffer=False,
+        num_urgent_orders=0,
     )
     defaults.update(kwargs)
     return InstanceConfig(**defaults)
