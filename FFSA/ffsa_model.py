@@ -115,6 +115,7 @@ class HGNNPolicy(nn.Module):
         action_mask: torch.Tensor,
         precedence_info: Dict,
         op_id_to_idx: Dict[int, int],
+        job_op_map: Dict[int, List[int]],
     ):
         """
         Args:
@@ -220,8 +221,8 @@ class HGNNPolicy(nn.Module):
                 # 조립 action: (comp_A_job_id, comp_B_job_id, machine_id)
                 comp_a_job, comp_b_job, mid = action
                 # component job의 마지막 active op 임베딩 사용
-                a_idx = self._get_job_last_op_idx(comp_a_job, op_id_to_idx)
-                b_idx = self._get_job_last_op_idx(comp_b_job, op_id_to_idx)
+                a_idx = self._get_job_last_op_idx(comp_a_job, op_id_to_idx, job_op_map)
+                b_idx = self._get_job_last_op_idx(comp_b_job, op_id_to_idx, job_op_map)
                 if a_idx is None or b_idx is None or mid >= machine_h.size(0):
                     logits.append(torch.tensor(-1e9, device=device))
                     continue
@@ -240,15 +241,13 @@ class HGNNPolicy(nn.Module):
         return probs, value
 
     def _get_job_last_op_idx(
-        self, job_id: int, op_id_to_idx: Dict[int, int]
+        self, job_id: int, op_id_to_idx: Dict[int, int], job_op_map: Dict[int, List[int]]
     ) -> Optional[int]:
-        """job의 op 중 op_id_to_idx에 있는 마지막 op 인덱스 반환"""
-        # op_id_to_idx 키 중 해당 job의 op를 찾는 건 환경 정보 없이 불가하므로
-        # job_id와 매핑을 외부에서 주입받는 방식 대신
-        # 가장 큰 op_id를 사용 (같은 job의 op들 중 마지막)
-        candidates = [idx for oid, idx in op_id_to_idx.items()]
-        # 단순히 첫 번째 매핑 반환 (호출부에서 job_op_map을 전달하는 방식으로 개선 가능)
-        return candidates[0] if candidates else None
+        """job 소속 op 중 graph에 존재하는 마지막 op의 인덱스 반환"""
+        for op_id in reversed(job_op_map.get(job_id, [])):
+            if op_id in op_id_to_idx:
+                return op_id_to_idx[op_id]
+        return None
 
     def _build_edge_feat_map(self, graph_data, device) -> Dict[Tuple[int, int], torch.Tensor]:
         edge_map = {}
@@ -346,9 +345,9 @@ class PPOAgent:
         actions = obs["actions"]
         mask = torch.tensor(obs["action_mask"], dtype=torch.float32)
         precedence_info = obs["precedence_info"]
-        # op_id → graph 노드 인덱스 매핑 구성
         op_id_to_idx = self._build_op_id_to_idx(obs)
-        return graph, actions, mask, precedence_info, op_id_to_idx
+        job_op_map = obs.get("job_op_map", {})
+        return graph, actions, mask, precedence_info, op_id_to_idx, job_op_map
 
     def _build_op_id_to_idx(self, obs: dict) -> Dict[int, int]:
         """precedence_info의 prev_map 키(활성 op_id)를 순서대로 인덱싱"""

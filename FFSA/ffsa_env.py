@@ -888,6 +888,7 @@ class FFSASchedulingEnv(gym.Env):
             },
             "assembly_pool": assembly_pool_info,
             "inactive_final_jobs": {p: list(v) for p, v in self.inactive_final_jobs.items()},
+            "job_op_map": {jid: list(ops) for jid, ops in self.job_ops.items()},
         }
 
     # ──────────────────────────────────────────────────────
