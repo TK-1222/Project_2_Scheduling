@@ -76,7 +76,9 @@ def train(
     gamma: float = 1.0,
     gae_lambda: float = 0.95,
     clip_ratio: float = 0.2,
-    entropy_coeff: float = 0.01,
+    entropy_coeff: float = 0.05,
+    entropy_min: float = 0.0005,
+    entropy_decay: float = 0.999,
     value_coeff: float = 0.5,
     update_epochs: int = 4,
     hidden_dim: int = 16,
@@ -95,6 +97,7 @@ def train(
     print(f"  Setup: {config.use_setup}")
     print(f"  유한 버퍼: {config.use_finite_buffer}")
     print(f"  Episodes: {num_episodes}  |  Window: {window_size}")
+    print(f"  Entropy: {entropy_coeff} → {entropy_min} (decay={entropy_decay})")
     print(f"  TensorBoard: runs/{exp_name}")
     print(f"{'='*60}")
 
@@ -121,6 +124,8 @@ def train(
         update_epochs=update_epochs,
         device=device,
     )
+
+    current_entropy = entropy_coeff  # 지수 감소 적용되는 현재 entropy 값
 
     episode_rewards = []
     episode_tardiness = []
@@ -178,11 +183,17 @@ def train(
             agent.buffer.clear()
             for obs_t, act_t, lp_t, r_t, v_t, d_t in best_traj:
                 agent.buffer.store(obs_t, act_t, lp_t, r_t, v_t, d_t)
+
+            # entropy 지수 감소 적용 후 업데이트
+            current_entropy = max(entropy_min, current_entropy * entropy_decay)
+            agent.entropy_coeff = current_entropy
+
             metrics = agent.update()
             window_buffer = []
             policy_updated = True
 
             logger.log_window(ep, metrics, best_wt, window_wt_list)
+            logger.writer.add_scalar("train/entropy_coeff", current_entropy, ep)
             log_schedule_to_tensorboard(logger.writer, best_schedule, ep)
 
         # 가중치 히스토그램
@@ -280,7 +291,9 @@ if __name__ == "__main__":
     parser.add_argument("--gamma",         type=float, default=1.0)
     parser.add_argument("--gae-lambda",    type=float, default=0.95)
     parser.add_argument("--clip-ratio",    type=float, default=0.2)
-    parser.add_argument("--entropy",       type=float, default=0.01)
+    parser.add_argument("--entropy",        type=float, default=0.05)
+    parser.add_argument("--entropy-min",   type=float, default=0.0005)
+    parser.add_argument("--entropy-decay", type=float, default=0.999)
     parser.add_argument("--value-coeff",   type=float, default=0.5)
     parser.add_argument("--update-epochs", type=int,   default=4)
     parser.add_argument("--hidden-dim",    type=int,   default=16)
@@ -313,6 +326,8 @@ if __name__ == "__main__":
             gae_lambda=args.gae_lambda,
             clip_ratio=args.clip_ratio,
             entropy_coeff=args.entropy,
+            entropy_min=args.entropy_min,
+            entropy_decay=args.entropy_decay,
             value_coeff=args.value_coeff,
             update_epochs=args.update_epochs,
             hidden_dim=args.hidden_dim,
