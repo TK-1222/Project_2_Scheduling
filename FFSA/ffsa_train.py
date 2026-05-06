@@ -78,7 +78,7 @@ def train(
     clip_ratio: float = 0.2,
     entropy_coeff: float = 0.05,
     entropy_min: float = 0.0005,
-    entropy_decay: float = 0.999,
+    entropy_decay: float = 0.9985,
     value_coeff: float = 0.5,
     update_epochs: int = 4,
     hidden_dim: int = 16,
@@ -172,7 +172,12 @@ def train(
         episode_deadlocks.append(int(ep_deadlock))
         window_buffer.append((wt, trajectory, schedule))
 
+        # entropy 지수 감소: 매 에피소드마다 적용
+        current_entropy = max(entropy_min, current_entropy * entropy_decay)
+        agent.entropy_coeff = current_entropy
+
         logger.log_episode(ep, wt, ms, total_reward, ep_deadlock)
+        logger.writer.add_scalar("train/entropy_coeff", current_entropy, ep)
 
         # window 종료: 최고 trajectory로 정책 업데이트
         policy_updated = False
@@ -184,16 +189,11 @@ def train(
             for obs_t, act_t, lp_t, r_t, v_t, d_t in best_traj:
                 agent.buffer.store(obs_t, act_t, lp_t, r_t, v_t, d_t)
 
-            # entropy 지수 감소 적용 후 업데이트
-            current_entropy = max(entropy_min, current_entropy * entropy_decay)
-            agent.entropy_coeff = current_entropy
-
             metrics = agent.update()
             window_buffer = []
             policy_updated = True
 
             logger.log_window(ep, metrics, best_wt, window_wt_list)
-            logger.writer.add_scalar("train/entropy_coeff", current_entropy, ep)
             log_schedule_to_tensorboard(logger.writer, best_schedule, ep)
 
         # 가중치 히스토그램
@@ -293,7 +293,7 @@ if __name__ == "__main__":
     parser.add_argument("--clip-ratio",    type=float, default=0.2)
     parser.add_argument("--entropy",        type=float, default=0.05)
     parser.add_argument("--entropy-min",   type=float, default=0.0005)
-    parser.add_argument("--entropy-decay", type=float, default=0.999)
+    parser.add_argument("--entropy-decay", type=float, default=0.9985)
     parser.add_argument("--value-coeff",   type=float, default=0.5)
     parser.add_argument("--update-epochs", type=int,   default=4)
     parser.add_argument("--hidden-dim",    type=int,   default=16)
