@@ -23,6 +23,7 @@ from torch.utils.tensorboard import SummaryWriter
 from ffsa_instance import InstanceConfig, simple_config, assembly_config, full_config
 from ffsa_env import FFSASchedulingEnv
 from ffsa_model import HGNNPolicy, PPOAgent
+from ffsa_viz import extract_schedule, log_schedule_to_tensorboard, visualize_schedule
 
 
 # ──────────────────────────────────────────────────────────
@@ -128,6 +129,7 @@ def train(
 
     window_buffer: list = []
     metrics: dict = {}
+    best_schedule: dict = {}
 
     for ep in range(1, num_episodes + 1):
         obs, _ = env.reset()
@@ -156,12 +158,13 @@ def train(
 
         wt = env.get_actual_weighted_tardiness()
         ms = env.get_makespan()
+        schedule = extract_schedule(env)   # env.reset() 전에 추출
 
         episode_rewards.append(total_reward)
         episode_tardiness.append(wt)
         episode_makespans.append(ms)
         episode_deadlocks.append(int(ep_deadlock))
-        window_buffer.append((wt, trajectory))
+        window_buffer.append((wt, trajectory, schedule))
 
         logger.log_episode(ep, wt, ms, total_reward, ep_deadlock)
 
@@ -169,7 +172,7 @@ def train(
         policy_updated = False
         if ep % window_size == 0:
             window_wt_list = [x[0] for x in window_buffer]
-            best_wt, best_traj = min(window_buffer, key=lambda x: x[0])
+            best_wt, best_traj, best_schedule = min(window_buffer, key=lambda x: x[0])
 
             agent.buffer.clear()
             for obs_t, act_t, lp_t, r_t, v_t, d_t in best_traj:
@@ -179,6 +182,7 @@ def train(
             policy_updated = True
 
             logger.log_window(ep, metrics, best_wt, window_wt_list)
+            log_schedule_to_tensorboard(logger.writer, best_schedule, ep)
 
         # 가중치 히스토그램
         if ep % hist_interval == 0:
@@ -208,6 +212,17 @@ def train(
     if dl_rate > 0:
         print(f"  데드락 발생 에피소드 비율 (최근 50): {dl_rate:.1f}%")
     print(f"{'='*60}")
+
+    # 최종 스케줄 그래프 PNG 저장 (마지막 window 최고 에피소드)
+    final_schedule = best_schedule
+    if window_buffer:
+        _, _, final_schedule = min(window_buffer, key=lambda x: x[0])
+    if final_schedule:
+        import matplotlib.pyplot as plt
+        save_path = f"runs/{exp_name}/final_schedule.png"
+        fig = visualize_schedule(final_schedule, ep=num_episodes, save_path=save_path)
+        plt.close(fig)
+        print(f"  최종 스케줄 그래프 저장: {save_path}")
 
     logger.finish()
     return policy, episode_rewards, episode_tardiness, episode_makespans
