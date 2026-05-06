@@ -140,21 +140,22 @@ def train(
         ep_deadlock = False
         trajectory = []
 
-        while not done and steps < max_steps:
-            if not obs["actions"]:
-                break
+        with torch.no_grad():
+            while not done and steps < max_steps:
+                if not obs["actions"]:
+                    break
 
-            action, log_prob, value = agent.select_action(obs)
-            next_obs, reward, done, truncated, info = env.step(action)
+                action, log_prob, value = agent.select_action(obs)
+                next_obs, reward, done, truncated, info = env.step(action)
 
-            trajectory.append((obs, action, log_prob, reward, value, done or truncated))
-            total_reward += reward
-            obs = next_obs
-            steps += 1
+                trajectory.append((obs, action, log_prob, reward, value, done or truncated))
+                total_reward += reward
+                obs = next_obs
+                steps += 1
 
-            if info.get("deadlock"):
-                ep_deadlock = True
-                break
+                if info.get("deadlock"):
+                    ep_deadlock = True
+                    break
 
         wt = env.get_actual_weighted_tardiness()
         ms = env.get_makespan()
