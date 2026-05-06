@@ -11,15 +11,14 @@ PPT Slide 13: 단계적 실험 전략
   - window 종료 시 가장 낮은 WT를 기록한 에피소드의 trajectory로 1회 정책 업데이트
   - 업데이트된 정책으로 다음 window 시작
 
-모니터링: TensorBoard + wandb 동시 로깅
-  - TensorBoard: 단일 실험 내 학습 곡선 상세 확인
-  - wandb: 실험 간 비교, 하이퍼파라미터 탐색 (Sweeps)
+모니터링: TensorBoard
+  tensorboard --logdir runs/
 """
 
 import argparse
 import numpy as np
 import torch
-from dataclasses import asdict
+from torch.utils.tensorboard import SummaryWriter
 
 from ffsa_instance import InstanceConfig, simple_config, assembly_config, full_config
 from ffsa_env import FFSASchedulingEnv
@@ -31,69 +30,30 @@ from ffsa_model import HGNNPolicy, PPOAgent
 # ──────────────────────────────────────────────────────────
 
 class Logger:
-    """TensorBoard + wandb 동시 로깅"""
+    """TensorBoard 로깅"""
 
-    def __init__(self, exp_name: str, config: InstanceConfig, hparams: dict, use_wandb: bool):
-        self.use_wandb = use_wandb
-
-        # TensorBoard
-        from torch.utils.tensorboard import SummaryWriter
+    def __init__(self, exp_name: str):
         self.writer = SummaryWriter(log_dir=f"runs/{exp_name}")
 
-        # wandb
-        if use_wandb:
-            import wandb
-            wandb.init(
-                project="ffsa-scheduling",
-                name=exp_name,
-                config={
-                    # 환경 설정
-                    "num_products": config.num_products,
-                    "num_stages": config.num_stages,
-                    "num_regular_orders": config.num_regular_orders,
-                    "num_urgent_orders": config.num_urgent_orders,
-                    "use_assembly": config.use_assembly,
-                    "use_setup": config.use_setup,
-                    "use_finite_buffer": config.use_finite_buffer,
-                    # 학습 하이퍼파라미터
-                    **hparams,
-                },
-            )
-
-    def log_episode(self, ep: int, wt: float, makespan: float, reward: float,
-                    deadlock: bool, window_size: int):
+    def log_episode(self, ep: int, wt: float, makespan: float, reward: float, deadlock: bool):
         """에피소드별 지표"""
-        scalars = {
-            "episode/weighted_tardiness": wt,
-            "episode/makespan": makespan,
-            "episode/reward": reward,
-            "episode/deadlock": int(deadlock),
-        }
-        for k, v in scalars.items():
-            self.writer.add_scalar(k, v, ep)
-        if self.use_wandb:
-            import wandb
-            wandb.log(scalars, step=ep)
+        self.writer.add_scalar("episode/weighted_tardiness", wt, ep)
+        self.writer.add_scalar("episode/makespan", makespan, ep)
+        self.writer.add_scalar("episode/reward", reward, ep)
+        self.writer.add_scalar("episode/deadlock", int(deadlock), ep)
 
     def log_window(self, ep: int, metrics: dict, best_wt: float, window_wt_list: list):
         """window 업데이트 시점 지표"""
-        scalars = {
-            "train/loss": metrics.get("loss", 0),
-            "train/policy_loss": metrics.get("policy_loss", 0),
-            "train/value_loss": metrics.get("value_loss", 0),
-            "train/entropy": metrics.get("entropy", 0),
-            "train/best_wt_in_window": best_wt,
-            "train/mean_wt_in_window": float(np.mean(window_wt_list)),
-            "train/worst_wt_in_window": float(np.max(window_wt_list)),
-        }
-        for k, v in scalars.items():
-            self.writer.add_scalar(k, v, ep)
-        if self.use_wandb:
-            import wandb
-            wandb.log(scalars, step=ep)
+        self.writer.add_scalar("train/loss",              metrics.get("loss", 0),         ep)
+        self.writer.add_scalar("train/policy_loss",       metrics.get("policy_loss", 0),  ep)
+        self.writer.add_scalar("train/value_loss",        metrics.get("value_loss", 0),   ep)
+        self.writer.add_scalar("train/entropy",           metrics.get("entropy", 0),      ep)
+        self.writer.add_scalar("train/best_wt_in_window", best_wt,                        ep)
+        self.writer.add_scalar("train/mean_wt_in_window", float(np.mean(window_wt_list)), ep)
+        self.writer.add_scalar("train/worst_wt_in_window",float(np.max(window_wt_list)),  ep)
 
     def log_weights(self, ep: int, policy: torch.nn.Module):
-        """신경망 가중치 분포 (TensorBoard 히스토그램)"""
+        """신경망 가중치 및 그래디언트 분포 히스토그램"""
         for name, param in policy.named_parameters():
             self.writer.add_histogram(f"weights/{name}", param.data, ep)
             if param.grad is not None:
@@ -101,9 +61,6 @@ class Logger:
 
     def finish(self):
         self.writer.close()
-        if self.use_wandb:
-            import wandb
-            wandb.finish()
 
 
 # ──────────────────────────────────────────────────────────
@@ -126,21 +83,7 @@ def train(
     log_interval: int = 10,
     hist_interval: int = 30,
     exp_name: str = "ffsa_run",
-    use_wandb: bool = True,
 ):
-    hparams = dict(
-        num_episodes=num_episodes,
-        window_size=window_size,
-        lr=lr,
-        gamma=gamma,
-        gae_lambda=gae_lambda,
-        clip_ratio=clip_ratio,
-        entropy_coeff=entropy_coeff,
-        value_coeff=value_coeff,
-        update_epochs=update_epochs,
-        hidden_dim=hidden_dim,
-    )
-
     print(f"{'='*60}")
     print(f"FFSA 스케줄링 RL 학습 시작  [{exp_name}]")
     print(f"  제품 수: {config.num_products}")
@@ -152,10 +95,9 @@ def train(
     print(f"  유한 버퍼: {config.use_finite_buffer}")
     print(f"  Episodes: {num_episodes}  |  Window: {window_size}")
     print(f"  TensorBoard: runs/{exp_name}")
-    print(f"  wandb: {'ON' if use_wandb else 'OFF'}")
     print(f"{'='*60}")
 
-    logger = Logger(exp_name, config, hparams, use_wandb)
+    logger = Logger(exp_name)
     env = FFSASchedulingEnv(config)
 
     policy = HGNNPolicy(
@@ -221,7 +163,7 @@ def train(
         episode_deadlocks.append(int(ep_deadlock))
         window_buffer.append((wt, trajectory))
 
-        logger.log_episode(ep, wt, ms, total_reward, ep_deadlock, window_size)
+        logger.log_episode(ep, wt, ms, total_reward, ep_deadlock)
 
         # window 종료: 최고 trajectory로 정책 업데이트
         policy_updated = False
@@ -238,7 +180,7 @@ def train(
 
             logger.log_window(ep, metrics, best_wt, window_wt_list)
 
-        # 가중치 히스토그램 (TensorBoard)
+        # 가중치 히스토그램
         if ep % hist_interval == 0:
             logger.log_weights(ep, policy)
 
@@ -315,22 +257,21 @@ def test_random_agent(config: InstanceConfig, num_episodes: int = 5):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FFSA 스케줄링 RL 학습")
-    parser.add_argument("--step",         type=int,   default=1, choices=[1, 2, 3])
-    parser.add_argument("--episodes",     type=int,   default=300)
-    parser.add_argument("--window",       type=int,   default=30)
-    parser.add_argument("--lr",           type=float, default=2e-4)
-    parser.add_argument("--gamma",        type=float, default=1.0)
-    parser.add_argument("--gae-lambda",   type=float, default=0.95)
-    parser.add_argument("--clip-ratio",   type=float, default=0.2)
-    parser.add_argument("--entropy",      type=float, default=0.01)
-    parser.add_argument("--value-coeff",  type=float, default=0.5)
-    parser.add_argument("--update-epochs",type=int,   default=4)
-    parser.add_argument("--hidden-dim",   type=int,   default=16)
-    parser.add_argument("--products",     type=int,   default=4)
-    parser.add_argument("--device",       type=str,   default="cpu")
-    parser.add_argument("--exp-name",     type=str,   default=None)
-    parser.add_argument("--no-wandb",     action="store_true")
-    parser.add_argument("--test-only",    action="store_true")
+    parser.add_argument("--step",          type=int,   default=1, choices=[1, 2, 3])
+    parser.add_argument("--episodes",      type=int,   default=300)
+    parser.add_argument("--window",        type=int,   default=30)
+    parser.add_argument("--lr",            type=float, default=2e-4)
+    parser.add_argument("--gamma",         type=float, default=1.0)
+    parser.add_argument("--gae-lambda",    type=float, default=0.95)
+    parser.add_argument("--clip-ratio",    type=float, default=0.2)
+    parser.add_argument("--entropy",       type=float, default=0.01)
+    parser.add_argument("--value-coeff",   type=float, default=0.5)
+    parser.add_argument("--update-epochs", type=int,   default=4)
+    parser.add_argument("--hidden-dim",    type=int,   default=16)
+    parser.add_argument("--products",      type=int,   default=4)
+    parser.add_argument("--device",        type=str,   default="cpu")
+    parser.add_argument("--exp-name",      type=str,   default=None)
+    parser.add_argument("--test-only",     action="store_true")
     args = parser.parse_args()
 
     step_name = {1: "simple", 2: "assembly", 3: "full"}[args.step]
@@ -361,5 +302,4 @@ if __name__ == "__main__":
             hidden_dim=args.hidden_dim,
             device=args.device,
             exp_name=exp_name,
-            use_wandb=not args.no_wandb,
         )
