@@ -71,7 +71,7 @@ class Logger:
 def train(
     config: InstanceConfig,
     num_episodes: int = 500,
-    window_size: int = 30,
+    window_size: int = 10,
     lr: float = 2e-4,
     gamma: float = 1.0,
     gae_lambda: float = 0.95,
@@ -274,7 +274,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FFSA 스케줄링 RL 학습")
     parser.add_argument("--step",          type=int,   default=1, choices=[1, 2, 3])
     parser.add_argument("--episodes",      type=int,   default=300)
-    parser.add_argument("--window",        type=int,   default=30)
+    parser.add_argument("--window",        type=int,   default=10)
     parser.add_argument("--lr",            type=float, default=2e-4)
     parser.add_argument("--gamma",         type=float, default=1.0)
     parser.add_argument("--gae-lambda",    type=float, default=0.95)
