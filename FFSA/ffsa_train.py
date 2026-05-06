@@ -82,7 +82,7 @@ def train(
     hidden_dim: int = 16,
     device: str = "cpu",
     log_interval: int = 10,
-    hist_interval: int = 30,
+    hist_interval: int = 100,
     exp_name: str = "ffsa_run",
 ):
     print(f"{'='*60}")
