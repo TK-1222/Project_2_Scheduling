@@ -407,11 +407,14 @@ def draw_hetero_graph(env, ep: int,
     G, pos, active_jobs, m_color = _build_graph_and_pos(env)
 
     if ax is None:
-        n_jobs    = max(len(active_jobs), 1)
-        n_stages  = env.instance.num_stages
+        import matplotlib
+        n_jobs   = max(len(active_jobs), 1)
+        n_stages = env.instance.num_stages
         fig_w = max(14, n_stages * X_GAP + 4)
         fig_h = max(8,  n_jobs  * abs(Y_OP_GAP) + 5)
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        # GUI 팝업 없는 non-interactive Figure (TensorBoard / PNG 저장용)
+        fig = matplotlib.figure.Figure(figsize=(fig_w, fig_h))
+        ax  = fig.add_subplot(111)
     else:
         ax.clear()
         fig = ax.figure
