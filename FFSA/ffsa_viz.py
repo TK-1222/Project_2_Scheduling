@@ -184,12 +184,7 @@ def _build_graph_and_pos(env) -> Tuple[nx.DiGraph, dict, list, Dict[int, str]]:
         G.add_node(key, ntype="buffer", stage_id=sid, occupancy=occupancy)
         pos[key] = (sid * X_GAP + BUF_X_OFFSET, buf_y)
 
-    # ── Precedence 엣지 (op → op, stage 순서) ──
-    op_id_to_key = {
-        env.operations[oid].op_id: f"Op{oid}"
-        for jid in active_jobs for oid in env.job_ops[jid]
-        if env.operations[oid].active
-    }
+    # ── Precedence 엣지 (op → BUF → op, 버퍼 경유) ──
     for jid in active_jobs:
         ops_list = env.job_ops[jid]
         for idx, oid in enumerate(ops_list):
@@ -200,7 +195,12 @@ def _build_graph_and_pos(env) -> Tuple[nx.DiGraph, dict, list, Dict[int, str]]:
                 next_oid = ops_list[idx + 1]
                 next_op = env.operations[next_oid]
                 if next_op.active:
-                    G.add_edge(f"Op{oid}", f"Op{next_oid}", etype="precedence")
+                    buf_key = f"BUF{op.stage_id}"
+                    if buf_key in G.nodes:
+                        G.add_edge(f"Op{oid}", buf_key, etype="precedence")
+                        G.add_edge(buf_key, f"Op{next_oid}", etype="precedence")
+                    else:
+                        G.add_edge(f"Op{oid}", f"Op{next_oid}", etype="precedence")
 
     # ── Candidate / Assigned 엣지 ──
     for jid in active_jobs:
