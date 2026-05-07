@@ -16,6 +16,7 @@ PPT Slide 13: 단계적 실험 전략
 """
 
 import argparse
+import os
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -23,7 +24,8 @@ from torch.utils.tensorboard import SummaryWriter
 from ffsa_instance import InstanceConfig, simple_config, assembly_config, full_config
 from ffsa_env import FFSASchedulingEnv
 from ffsa_model import HGNNPolicy, PPOAgent
-from ffsa_viz import extract_schedule, log_schedule_to_tensorboard, visualize_schedule
+import matplotlib.pyplot as plt
+from ffsa_viz import draw_hetero_graph, log_hetero_graph_to_tensorboard
 
 
 # ──────────────────────────────────────────────────────────
@@ -85,6 +87,7 @@ def train(
     device: str = "cpu",
     log_interval: int = 10,
     hist_interval: int = 100,
+    viz_interval: int = 10,
     exp_name: str = "ffsa_run",
 ):
     print(f"{'='*60}")
@@ -99,10 +102,20 @@ def train(
     print(f"  Episodes: {num_episodes}  |  Window: {window_size}")
     print(f"  Entropy: {entropy_coeff} → {entropy_min} (decay={entropy_decay})")
     print(f"  TensorBoard: runs/{exp_name}")
+    print(f"  Viz interval: {viz_interval} 에피소드마다 그래프 갱신")
     print(f"{'='*60}")
 
     logger = Logger(exp_name)
     env = FFSASchedulingEnv(config)
+
+    # ── plt.ion() 실시간 팝업 창 설정 ──
+    plt.ion()
+    n_stages = config.num_stages
+    n_jobs   = config.num_regular_orders + config.num_urgent_orders
+    fig_w = max(14, n_stages * 4.5 + 4)
+    fig_h = max(8,  max(n_jobs, 1) * 1.8 + 5)
+    live_fig, live_ax = plt.subplots(figsize=(fig_w, fig_h))
+    live_fig.canvas.manager.set_window_title(f"FFSA 학습 모니터 [{exp_name}]")
 
     policy = HGNNPolicy(
         op_feat_dim=10,
@@ -164,13 +177,19 @@ def train(
 
         wt = env.get_actual_weighted_tardiness()
         ms = env.get_makespan()
-        schedule = extract_schedule(env)   # env.reset() 전에 추출
 
         episode_rewards.append(total_reward)
         episode_tardiness.append(wt)
         episode_makespans.append(ms)
         episode_deadlocks.append(int(ep_deadlock))
-        window_buffer.append((wt, trajectory, schedule))
+        window_buffer.append((wt, trajectory))
+
+        # ── plt.ion() 실시간 그래프 갱신 ──
+        if ep % viz_interval == 0 or ep == 1:
+            draw_hetero_graph(env, ep, ax=live_ax)
+            live_fig.canvas.draw()
+            live_fig.canvas.flush_events()
+            plt.pause(0.01)
 
         # entropy 지수 감소: 매 에피소드마다 적용
         current_entropy = max(entropy_min, current_entropy * entropy_decay)
@@ -183,7 +202,7 @@ def train(
         policy_updated = False
         if ep % window_size == 0:
             window_wt_list = [x[0] for x in window_buffer]
-            best_wt, best_traj, best_schedule = min(window_buffer, key=lambda x: x[0])
+            best_wt, best_traj = min(window_buffer, key=lambda x: x[0])
 
             agent.buffer.clear()
             for obs_t, act_t, lp_t, r_t, v_t, d_t in best_traj:
@@ -194,7 +213,7 @@ def train(
             policy_updated = True
 
             logger.log_window(ep, metrics, best_wt, window_wt_list)
-            log_schedule_to_tensorboard(logger.writer, best_schedule, ep)
+            log_hetero_graph_to_tensorboard(logger.writer, env, ep)
 
         # 가중치 히스토그램
         if ep % hist_interval == 0:
@@ -225,17 +244,16 @@ def train(
         print(f"  데드락 발생 에피소드 비율 (최근 50): {dl_rate:.1f}%")
     print(f"{'='*60}")
 
-    # 최종 스케줄 그래프 PNG 저장 (마지막 window 최고 에피소드)
-    final_schedule = best_schedule
-    if window_buffer:
-        _, _, final_schedule = min(window_buffer, key=lambda x: x[0])
-    if final_schedule:
-        import matplotlib.pyplot as plt
-        save_path = f"runs/{exp_name}/final_schedule.png"
-        fig = visualize_schedule(final_schedule, ep=num_episodes, save_path=save_path)
-        plt.close(fig)
-        print(f"  최종 스케줄 그래프 저장: {save_path}")
+    # 최종 이종 그래프 PNG 저장
+    save_path = f"runs/{exp_name}/final_graph.png"
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    final_fig = draw_hetero_graph(env, ep=num_episodes)
+    final_fig.savefig(save_path, dpi=100, bbox_inches="tight")
+    plt.close(final_fig)
+    print(f"  최종 그래프 저장: {save_path}")
 
+    plt.ioff()
+    plt.close(live_fig)
     logger.finish()
     return policy, episode_rewards, episode_tardiness, episode_makespans
 
@@ -299,6 +317,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden-dim",    type=int,   default=16)
     parser.add_argument("--products",      type=int,   default=4)
     parser.add_argument("--device",        type=str,   default="cpu")
+    parser.add_argument("--viz-interval",  type=int,   default=10)
     parser.add_argument("--exp-name",      type=str,   default=None)
     parser.add_argument("--test-only",     action="store_true")
     args = parser.parse_args()
@@ -332,5 +351,6 @@ if __name__ == "__main__":
             update_epochs=args.update_epochs,
             hidden_dim=args.hidden_dim,
             device=args.device,
+            viz_interval=args.viz_interval,
             exp_name=exp_name,
         )

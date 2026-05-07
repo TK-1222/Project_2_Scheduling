@@ -1,15 +1,25 @@
 """
-FFSA 스케줄링 결과 시각화
-===========================
-[태림]라인3개 각각 표현.py 스타일 적용:
+FFSA 이종 그래프 시각화
+========================
+[태림]기본 그래프 수정.py 스타일 계승:
   - networkx DiGraph 기반
-  - 기계 노드 (삼각형) / 버퍼 노드 (원)
-  - 제품별 색상 엣지로 실제 job 이동 경로 표현
+  - nx.draw_networkx_nodes / edges + ax.text 패턴
+  - Stage-Column 레이아웃
 
-사용 흐름:
-  schedule = extract_schedule(env)          # 에피소드 완료 직후 호출
-  log_schedule_to_tensorboard(writer, schedule, ep)   # TensorBoard 기록
-  visualize_schedule(schedule, ep, save_path="out.png")  # PNG 저장
+레이아웃:
+  X축  : 스테이지 번호 (stage × X_GAP)
+  Y 상단: 기계 노드 (정사각형 ■)  — 스테이지별 묶음
+  Y 중단: 오퍼레이션 노드 (삼각형 ▲) — job별 행
+  X 중간: 버퍼 노드 (원 ●) — 스테이지 사이
+
+엣지:
+  Precedence  : op → op  검정 화살표
+  Candidate   : machine → ready op  점선, 기계별 색
+  Assigned    : machine → processing op  실선 굵게, 기계별 색
+
+연동:
+  draw_hetero_graph(env, ep, ax)       → plt.ion() 팝업 창 실시간 갱신
+  log_hetero_graph_to_tensorboard(...) → TensorBoard Images 탭
 """
 
 import os
@@ -18,31 +28,54 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib import rcParams
 from matplotlib.font_manager import FontProperties, fontManager
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Dict, List, Tuple
 
 
 # ─────────────────────────────────────────────────────────
-# 색상 / 스타일 (태림 코드 스타일 계승)
+# 스타일 상수 (태림 코드 계승)
 # ─────────────────────────────────────────────────────────
 
-PRODUCT_COLORS = [
-    "#e41a1c", "#377eb8", "#4daf4a", "#984ea3",
-    "#ff7f00", "#a65628", "#f781bf", "#636363",
-]
-
-NODE_SIZE = {"machine": 1600, "buffer": 900, "assembly": 2000, "done": 1000}
-NODE_SHAPE = {"machine": "^", "buffer": "o", "assembly": "s", "done": "D"}
-NODE_COLOR = {
-    "machine":  ("#8ecae6", "#5b8bd0"),   # fill, edge (태림 operation 색상)
-    "buffer":   ("#86df7f", "#2e8b57"),   # fill, edge (태림 buffer 색상)
-    "assembly": ("#ffd166", "#9e5c00"),
-    "done":     ("#aaaaaa", "#444444"),
+NODE_SHAPE = {
+    "machine":   "s",   # 정사각형 ■
+    "operation": "^",   # 삼각형  ▲ (태림 operation 모양)
+    "buffer":    "o",   # 원      ● (태림 buffer 모양)
+}
+NODE_SIZE = {
+    "machine":   1300,
+    "operation": 1700,
+    "buffer":    850,
 }
 
-EDGE_STRUCTURE = "#dddddd"   # 가능 경로 (연한 회색)
-EDGE_JOB_WIDTH = 2.0         # job 경로 엣지 기본 굵기
-LABEL_ABOVE = 0.38           # 태림과 동일한 라벨 오프셋
-LABEL_BELOW = -0.38
+# Op 상태별 (fill, edge_color)
+OP_STYLE = {
+    "done":       ("#1565c0", "#0d47a1"),   # 진파랑   : 완료
+    "processing": ("#8ecae6", "#e63946"),   # 파랑+빨강 테두리: 처리 중
+    "ready":      ("#8ecae6", "#5b8bd0"),   # 태림 파랑 : 배정 대기
+    "waiting":    ("#b0bec5", "#78909c"),   # 회청     : 버퍼 대기
+    "inactive":   ("#eeeeee", "#bdbdbd"),   # 연회색   : 비활성
+}
+
+MACHINE_IDLE_STYLE = ("#f4a261", "#e76f51")   # 연주황: 유휴
+MACHINE_BUSY_STYLE = ("#ef233c", "#9b2226")   # 빨강  : 처리 중
+BUFFER_STYLE       = ("#86df7f", "#2e8b57")   # 태림 버퍼 초록
+
+# 기계별 고유 색 (candidate / assigned 엣지 + 범례)
+MACHINE_PALETTE = [
+    "#e41a1c", "#377eb8", "#ff7f00", "#4daf4a",
+    "#984ea3", "#a65628", "#f781bf", "#636363",
+    "#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3",
+]
+
+EDGE_PREC_COLOR = "#222222"   # precedence 화살표 색
+LABEL_OFFSET_Y  = -0.30       # 태림과 같은 라벨 아래 오프셋
+
+# 레이아웃
+X_GAP          = 4.5    # 스테이지 간 X 간격
+BUF_X_OFFSET   = 2.25   # 버퍼 X = stage_x + BUF_X_OFFSET
+Y_MACHINE_TOP  = 4.2    # 기계 행 Y
+MACHINE_H_GAP  = 1.1    # 같은 스테이지 내 기계 수평 간격
+Y_OP_BASE      = 0.5    # 첫 번째 job op Y
+Y_OP_GAP       = -1.8   # job 행 간 Y 간격 (아래로)
 
 
 # ─────────────────────────────────────────────────────────
@@ -66,341 +99,350 @@ def _init_font() -> Optional[FontProperties]:
 
 
 # ─────────────────────────────────────────────────────────
-# 스케줄 데이터 추출
+# 그래프 & 좌표 생성
 # ─────────────────────────────────────────────────────────
 
-def extract_schedule(env) -> dict:
+def _build_graph_and_pos(env) -> Tuple[nx.DiGraph, dict, list, Dict[int, str]]:
     """
-    env에서 시각화에 필요한 스케줄 스냅샷 추출.
-    env.reset() 이전에 호출해야 함.
-    """
-    ops = {}
-    for op_id, op in env.operations.items():
-        ops[op_id] = {
-            "job_id":          op.job_id,
-            "stage_id":        op.stage_id,
-            "product_id":      op.product_id,
-            "is_done":         op.is_done,
-            "machine_id":      op.machine_id,
-            "start_time":      op.start_time,
-            "completion_time": op.completion_time,
-        }
+    env 실시간 상태 → 시각화용 networkx DiGraph + 좌표 반환.
 
-    jobs = {}
-    for jid, j in env.instance.jobs.items():
-        jobs[jid] = {
-            "product_id":   j.product_id,
-            "is_component": j.is_component,
-            "is_final_job": j.is_final_job,
-            "due_date":     j.due_date,
-            "order_id":     j.order_id,
-        }
+    노드 종류:
+      M{mid}   : 기계
+      Op{oid}  : 오퍼레이션 (active op만 포함)
+      BUF{sid} : 버퍼 (스테이지 경계마다 1개)
 
-    machines = {}
-    for mid, ms in env.machine_states.items():
-        machines[mid] = {
-            "stage_id":        ms.stage_id,
-            "last_product":    ms.last_product,
-            "total_busy_time": ms.total_busy_time,
-        }
-
-    return {
-        "ops":               ops,
-        "jobs":              jobs,
-        "job_ops":           {jid: list(ops_list) for jid, ops_list in env.job_ops.items()},
-        "machines":          machines,
-        "machines_by_stage": {sid: list(mids) for sid, mids in env.instance.machines_by_stage.items()},
-        "num_stages":        env.instance.num_stages,
-        "num_products":      env.config.num_products,
-        "use_assembly":      env.config.use_assembly,
-        "assembly_stage":    env.config.assembly_stage_idx,
-        "makespan":          env.get_makespan(),
-        "wt":                env.get_actual_weighted_tardiness(),
-    }
-
-
-# ─────────────────────────────────────────────────────────
-# 그래프 빌드
-# ─────────────────────────────────────────────────────────
-
-def build_flow_graph(schedule: dict) -> nx.DiGraph:
-    """
-    태림 스타일 DiGraph 생성.
-    노드: 기계(삼각형), 버퍼(원), 조립(사각형), 완료(다이아몬드)
-    엣지: 구조 엣지(연회색) + job 실제 이동 경로(제품색)
+    엣지 종류:
+      precedence : op → op  (stage 순서)
+      candidate  : machine → ready op  (처리 가능 후보, 점선)
+      assigned   : machine → op  (현재 배정, 실선)
     """
     G = nx.DiGraph()
-    num_stages   = schedule["num_stages"]
-    machines     = schedule["machines"]
-    machines_by_stage = schedule["machines_by_stage"]
-    use_assembly = schedule["use_assembly"]
-    asm_stage    = schedule["assembly_stage"]
+    pos: dict = {}
+
+    num_stages = env.instance.num_stages
+    mbs = env.instance.machines_by_stage
+
+    # ── 활성 job 목록 (active op이 1개라도 있는 job) ──
+    active_jobs = sorted([
+        jid for jid in env.job_ops
+        if any(env.operations[oid].active for oid in env.job_ops[jid])
+    ])
+    job_y = {jid: Y_OP_BASE + i * Y_OP_GAP for i, jid in enumerate(active_jobs)}
+
+    # ── 기계별 색상 매핑 ──
+    all_mids = sorted(env.machine_states.keys())
+    m_color: Dict[int, str] = {
+        mid: MACHINE_PALETTE[i % len(MACHINE_PALETTE)]
+        for i, mid in enumerate(all_mids)
+    }
 
     # ── 기계 노드 ──
-    for mid, mdata in machines.items():
-        sid = mdata["stage_id"]
-        is_asm = (use_assembly and sid == asm_stage)
-        ntype = "assembly" if is_asm else "machine"
-        G.add_node(f"M{mid}",
-                   ntype=ntype, stage_id=sid, machine_id=mid,
-                   last_product=mdata["last_product"],
-                   label=f"M{mid}")
-
-    # ── 버퍼 노드 (stage 앞단) ──
     for sid in range(num_stages):
-        G.add_node(f"BUF{sid}",
-                   ntype="buffer", stage_id=sid,
-                   label=f"Buf{sid}")
-
-    # ── 완료 노드 ──
-    G.add_node("DONE", ntype="done", stage_id=num_stages, label="완료")
-
-    # ── 구조 엣지 (배경, 가능한 경로) ──
-    for sid in range(num_stages):
-        for mid in machines_by_stage.get(sid, []):
-            # 버퍼 → 기계
-            G.add_edge(f"BUF{sid}", f"M{mid}",
-                       etype="structure", color=EDGE_STRUCTURE, width=0.8)
-            # 기계 → 다음 버퍼 (마지막 stage 제외)
-            if sid < num_stages - 1:
-                G.add_edge(f"M{mid}", f"BUF{sid+1}",
-                           etype="structure", color=EDGE_STRUCTURE, width=0.8)
-            else:
-                G.add_edge(f"M{mid}", "DONE",
-                           etype="structure", color=EDGE_STRUCTURE, width=0.8)
-
-    # ── Job 실제 이동 경로 엣지 ──
-    job_ops = schedule["job_ops"]
-    ops     = schedule["ops"]
-    jobs    = schedule["jobs"]
-
-    for jid, op_ids in job_ops.items():
-        job = jobs.get(jid)
-        if job is None:
-            continue
-        color = PRODUCT_COLORS[job["product_id"] % len(PRODUCT_COLORS)]
-        pid   = job["product_id"]
-
-        done_ops = [
-            ops[oid] for oid in op_ids
-            if oid in ops and ops[oid]["is_done"] and ops[oid]["machine_id"] is not None
-        ]
-        if not done_ops:
-            continue
-
-        for i, op in enumerate(done_ops):
-            curr_m = f"M{op['machine_id']}"
-            buf    = f"BUF{op['stage_id']}"
-
-            # 버퍼 → 기계 경로 기록
-            _add_job_edge(G, buf, curr_m, color, pid)
-
-            if i > 0:
-                # 이전 기계 → 이 버퍼
-                prev_m = f"M{done_ops[i-1]['machine_id']}"
-                _add_job_edge(G, prev_m, buf, color, pid)
-
-        # 마지막 기계 → 완료
-        last_m = f"M{done_ops[-1]['machine_id']}"
-        _add_job_edge(G, last_m, "DONE", color, pid)
-
-    return G
-
-
-def _add_job_edge(G: nx.DiGraph, src: str, dst: str, color: str, pid: int):
-    """job 경로 엣지 추가 (중복 시 굵기 증가)"""
-    if G.has_edge(src, dst) and G[src][dst].get("etype") == "job":
-        G[src][dst]["width"] += 0.5
-        G[src][dst]["count"] += 1
-    else:
-        G.add_edge(src, dst, etype="job", color=color,
-                   width=EDGE_JOB_WIDTH, product_id=pid, count=1)
-
-
-# ─────────────────────────────────────────────────────────
-# 좌표 배치 (태림 코드와 동일한 고정 좌표 방식)
-# ─────────────────────────────────────────────────────────
-
-def get_positions(schedule: dict) -> dict:
-    """
-    x축: stage, y축: stage 내 기계 번호
-    버퍼 노드는 stage 직전 위치 (x - 0.5 * x_spacing)
-    """
-    pos: dict = {}
-    num_stages        = schedule["num_stages"]
-    machines_by_stage = schedule["machines_by_stage"]
-    machines          = schedule["machines"]
-
-    X_SPACING = 3.5
-    Y_SPACING = 2.2
-    BUF_OFFSET = 1.5   # 버퍼 x 위치 = stage_x - BUF_OFFSET
-
-    for sid in range(num_stages):
-        mids = machines_by_stage.get(sid, [])
-        n    = len(mids)
-        x    = sid * X_SPACING
+        mids = sorted(mbs.get(sid, []))
+        n = len(mids)
+        x_base = sid * X_GAP
         for i, mid in enumerate(mids):
-            y = (i - (n - 1) / 2.0) * Y_SPACING
-            pos[f"M{mid}"] = (x, y)
+            key = f"M{mid}"
+            ms = env.machine_states[mid]
+            is_busy = not ms.is_idle
+            m_x = x_base + (i - (n - 1) / 2.0) * MACHINE_H_GAP
+            G.add_node(key, ntype="machine", machine_id=mid,
+                       is_busy=is_busy, stage_id=sid)
+            pos[key] = (m_x, Y_MACHINE_TOP)
 
-        # 버퍼 노드 위치
-        buf_x = x - BUF_OFFSET
-        pos[f"BUF{sid}"] = (buf_x, 0.0)
+    # ── Op 노드 ──
+    for jid in active_jobs:
+        for oid in env.job_ops[jid]:
+            op = env.operations[oid]
+            if not op.active:
+                continue
+            key = f"Op{oid}"
+            x = op.stage_id * X_GAP
+            y = job_y[jid]
 
-    # 완료 노드
-    pos["DONE"] = (num_stages * X_SPACING, 0.0)
-    return pos
+            if op.is_done:
+                status = "done"
+            elif op.is_processing:
+                status = "processing"
+            elif op.is_ready:
+                status = "ready"
+            elif op.buffer_waiting:
+                status = "waiting"
+            else:
+                status = "inactive"
+
+            G.add_node(key, ntype="operation", op_id=oid, job_id=jid,
+                       stage_id=op.stage_id, status=status,
+                       product_id=op.product_id, machine_id=op.machine_id)
+            pos[key] = (x, y)
+
+    # ── 버퍼 노드 (스테이지 경계마다 1개) ──
+    buf_y = (sum(job_y.values()) / len(job_y)) if job_y else 0.0
+    for sid in range(num_stages - 1):
+        key = f"BUF{sid}"
+        occupancy = len(env.buffers[sid].queue) if sid in env.buffers else 0
+        G.add_node(key, ntype="buffer", stage_id=sid, occupancy=occupancy)
+        pos[key] = (sid * X_GAP + BUF_X_OFFSET, buf_y)
+
+    # ── Precedence 엣지 (op → op, stage 순서) ──
+    op_id_to_key = {
+        env.operations[oid].op_id: f"Op{oid}"
+        for jid in active_jobs for oid in env.job_ops[jid]
+        if env.operations[oid].active
+    }
+    for jid in active_jobs:
+        ops_list = env.job_ops[jid]
+        for idx, oid in enumerate(ops_list):
+            op = env.operations[oid]
+            if not op.active:
+                continue
+            if idx < len(ops_list) - 1:
+                next_oid = ops_list[idx + 1]
+                next_op = env.operations[next_oid]
+                if next_op.active:
+                    G.add_edge(f"Op{oid}", f"Op{next_oid}", etype="precedence")
+
+    # ── Candidate / Assigned 엣지 ──
+    for jid in active_jobs:
+        for oid in env.job_ops[jid]:
+            op = env.operations[oid]
+            if not op.active:
+                continue
+            op_key = f"Op{oid}"
+            sid = op.stage_id
+
+            if op.machine_id is not None:
+                # Assigned: 현재 배정된 기계 → op
+                m_key = f"M{op.machine_id}"
+                if m_key in G:
+                    G.add_edge(m_key, op_key, etype="assigned",
+                               color=m_color[op.machine_id])
+            elif op.is_ready:
+                # Candidate: ready op에 대해서만 (그래프 과밀 방지)
+                for mid in sorted(env.instance.machines_by_stage.get(sid, [])):
+                    m_data = env.instance.machines[mid]
+                    if op.product_id in m_data.compatible_products:
+                        m_key = f"M{mid}"
+                        if m_key in G:
+                            G.add_edge(m_key, op_key, etype="candidate",
+                                       color=m_color[mid])
+
+    return G, pos, active_jobs, m_color
 
 
 # ─────────────────────────────────────────────────────────
-# 그리기 (태림 draw_nodes / draw_edges / draw_labels 패턴)
+# 노드 그리기 (태림 draw_nodes 패턴)
+# ─────────────────────────────────────────────────────────
+
+def _draw_nodes(G: nx.DiGraph, pos: dict, ax):
+    # ── 기계 노드 (유휴 / 처리 중 구분) ──
+    for is_busy in (False, True):
+        nlist = [n for n, d in G.nodes(data=True)
+                 if d.get("ntype") == "machine" and d.get("is_busy") == is_busy]
+        if not nlist:
+            continue
+        fill, edge_c = MACHINE_BUSY_STYLE if is_busy else MACHINE_IDLE_STYLE
+        nx.draw_networkx_nodes(
+            G, pos, nodelist=nlist,
+            node_shape=NODE_SHAPE["machine"],
+            node_color=fill, edgecolors=edge_c,
+            linewidths=2.0, node_size=NODE_SIZE["machine"], ax=ax,
+        )
+
+    # ── Op 노드 (상태별) ──
+    for status, (fill, edge_c) in OP_STYLE.items():
+        nlist = [n for n, d in G.nodes(data=True)
+                 if d.get("ntype") == "operation" and d.get("status") == status]
+        if not nlist:
+            continue
+        lw = 3.0 if status == "processing" else 1.5
+        nx.draw_networkx_nodes(
+            G, pos, nodelist=nlist,
+            node_shape=NODE_SHAPE["operation"],
+            node_color=fill, edgecolors=edge_c,
+            linewidths=lw, node_size=NODE_SIZE["operation"], ax=ax,
+        )
+
+    # ── 버퍼 노드 ──
+    buf_nodes = [n for n, d in G.nodes(data=True) if d.get("ntype") == "buffer"]
+    if buf_nodes:
+        fill, edge_c = BUFFER_STYLE
+        nx.draw_networkx_nodes(
+            G, pos, nodelist=buf_nodes,
+            node_shape=NODE_SHAPE["buffer"],
+            node_color=fill, edgecolors=edge_c,
+            linewidths=1.5, node_size=NODE_SIZE["buffer"], ax=ax,
+        )
+
+
+# ─────────────────────────────────────────────────────────
+# 엣지 그리기
 # ─────────────────────────────────────────────────────────
 
 def _draw_edges(G: nx.DiGraph, pos: dict, ax):
-    # 구조 엣지 (연한 배경)
-    struct = [(u, v) for u, v, d in G.edges(data=True) if d.get("etype") == "structure"]
-    if struct:
-        nx.draw_networkx_edges(G, pos, edgelist=struct,
-                               edge_color=EDGE_STRUCTURE, width=0.8,
-                               arrows=False, ax=ax)
+    # ── Precedence: 검정 화살표 ──
+    prec = [(u, v) for u, v, d in G.edges(data=True) if d.get("etype") == "precedence"]
+    if prec:
+        nx.draw_networkx_edges(
+            G, pos, edgelist=prec,
+            edge_color=EDGE_PREC_COLOR, width=1.8,
+            arrows=True, arrowstyle="-|>", arrowsize=18,
+            connectionstyle="arc3,rad=0.0", ax=ax,
+        )
 
-    # job 경로 엣지
-    job_edges = [(u, v) for u, v, d in G.edges(data=True) if d.get("etype") == "job"]
-    if job_edges:
-        colors = [G[u][v]["color"] for u, v in job_edges]
-        widths = [G[u][v]["width"] for u, v in job_edges]
-        nx.draw_networkx_edges(G, pos, edgelist=job_edges,
-                               edge_color=colors, width=widths,
-                               arrows=True, arrowstyle="-|>", arrowsize=14,
-                               connectionstyle="arc3,rad=0.08", ax=ax)
+    # ── Candidate: 점선, 기계별 색, 반투명 ──
+    cand = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("etype") == "candidate"]
+    for u, v, d in cand:
+        nx.draw_networkx_edges(
+            G, pos, edgelist=[(u, v)],
+            edge_color=d["color"], width=1.3, alpha=0.55,
+            style="dashed", arrows=False, ax=ax,
+        )
+
+    # ── Assigned: 실선 굵게, 기계별 색 ──
+    asgn = [(u, v, d) for u, v, d in G.edges(data=True) if d.get("etype") == "assigned"]
+    for u, v, d in asgn:
+        nx.draw_networkx_edges(
+            G, pos, edgelist=[(u, v)],
+            edge_color=d["color"], width=3.5,
+            arrows=True, arrowstyle="-|>", arrowsize=20,
+            ax=ax,
+        )
 
 
-def _draw_nodes(G: nx.DiGraph, pos: dict, ax):
-    for ntype in ("machine", "buffer", "assembly", "done"):
-        nodelist = [n for n, d in G.nodes(data=True) if d.get("ntype") == ntype]
-        if not nodelist:
+# ─────────────────────────────────────────────────────────
+# 라벨 그리기 (태림 draw_labels_and_markers 패턴)
+# ─────────────────────────────────────────────────────────
+
+def _draw_labels(G: nx.DiGraph, pos: dict, env,
+                 active_jobs: list, kfont: Optional[FontProperties], ax):
+    # ── 기계 라벨 ──
+    for n, d in G.nodes(data=True):
+        if d.get("ntype") != "machine":
             continue
-        fill_base, edge_c = NODE_COLOR[ntype]
-        fills = []
-        for n in nodelist:
-            d = G.nodes[n]
-            lp = d.get("last_product")
-            # 기계/조립 노드: 마지막으로 처리한 제품 색상으로 채우기
-            if ntype in ("machine", "assembly") and lp is not None:
-                fills.append(PRODUCT_COLORS[lp % len(PRODUCT_COLORS)])
-            else:
-                fills.append(fill_base)
+        x, y = pos[n]
+        ax.text(x, y + LABEL_OFFSET_Y, n,
+                fontproperties=kfont, ha="center", va="top",
+                fontsize=8, color="black")
 
-        nx.draw_networkx_nodes(G, pos, nodelist=nodelist,
-                               node_shape=NODE_SHAPE[ntype],
-                               node_color=fills,
-                               edgecolors=edge_c, linewidths=1.5,
-                               node_size=NODE_SIZE[ntype], ax=ax)
-
-
-def _draw_labels(G: nx.DiGraph, pos: dict, schedule: dict,
-                 kfont: Optional[FontProperties], ax):
-    num_stages = schedule["num_stages"]
-    X_SPACING  = 3.5
-
-    for node, data in G.nodes(data=True):
-        if node not in pos:
+    # ── Op 라벨: J{jid} / S{sid} ──
+    for n, d in G.nodes(data=True):
+        if d.get("ntype") != "operation":
             continue
-        x, y = pos[node]
-        label = data.get("label", "")
-        if not label:
-            continue
-        ax.text(x, y + LABEL_ABOVE, label,
-                fontproperties=kfont, ha="center", va="bottom",
+        x, y = pos[n]
+        jid = d["job_id"]
+        sid = d["stage_id"]
+        ax.text(x, y + LABEL_OFFSET_Y, f"J{jid}\nS{sid}",
+                fontproperties=kfont, ha="center", va="top",
                 fontsize=7, color="black")
 
-    # stage 제목 (태림의 라인 타이틀에 해당)
-    for sid in range(num_stages):
-        x = sid * X_SPACING
-        ax.text(x, -3.8, f"Stage {sid}",
+    # ── 버퍼 라벨: Buf{sid} (점유) ──
+    for n, d in G.nodes(data=True):
+        if d.get("ntype") != "buffer":
+            continue
+        x, y = pos[n]
+        sid = d["stage_id"]
+        occ = d.get("occupancy", 0)
+        ax.text(x, y + LABEL_OFFSET_Y, f"Buf{sid}\n({occ})",
                 fontproperties=kfont, ha="center", va="top",
-                fontsize=9, fontweight="bold")
+                fontsize=7, color="#2e8b57")
+
+    # ── Stage 제목 (태림의 라인 타이틀에 해당) ──
+    for sid in range(env.instance.num_stages):
+        x = sid * X_GAP
+        ax.text(x, Y_MACHINE_TOP + 1.0, f"Stage {sid}",
+                fontproperties=kfont, ha="center", va="bottom",
+                fontsize=10, fontweight="bold", color="#0b1f8a")
+
+    # ── Job 행 라벨 (왼쪽 여백) ──
+    for i, jid in enumerate(active_jobs):
+        y = Y_OP_BASE + i * Y_OP_GAP
+        pid = env.instance.jobs[jid].product_id
+        ax.text(-2.0, y, f"J{jid}  (P{pid})",
+                fontproperties=kfont, ha="right", va="center",
+                fontsize=8, color="#333333")
 
 
-def _draw_legend(G: nx.DiGraph, schedule: dict,
-                 kfont: Optional[FontProperties], ax):
-    num_prods = schedule["num_products"]
+# ─────────────────────────────────────────────────────────
+# 범례 (태림 mpatches 패턴)
+# ─────────────────────────────────────────────────────────
+
+def _draw_legend(m_color: Dict[int, str], kfont: Optional[FontProperties], ax):
     patches = [
-        mpatches.Patch(color=PRODUCT_COLORS[pid % len(PRODUCT_COLORS)],
-                       label=f"제품 {pid}")
-        for pid in range(num_prods)
+        mpatches.Patch(facecolor=OP_STYLE["done"][0],
+                       edgecolor=OP_STYLE["done"][1],       label="Op: 완료 ▲"),
+        mpatches.Patch(facecolor=OP_STYLE["processing"][0],
+                       edgecolor=OP_STYLE["processing"][1], label="Op: 처리 중 ▲"),
+        mpatches.Patch(facecolor=OP_STYLE["ready"][0],
+                       edgecolor=OP_STYLE["ready"][1],      label="Op: 배정 대기 ▲"),
+        mpatches.Patch(facecolor=OP_STYLE["waiting"][0],
+                       edgecolor=OP_STYLE["waiting"][1],    label="Op: 버퍼 대기 ▲"),
+        mpatches.Patch(facecolor=MACHINE_IDLE_STYLE[0],
+                       edgecolor=MACHINE_IDLE_STYLE[1],     label="기계: 유휴 ■"),
+        mpatches.Patch(facecolor=MACHINE_BUSY_STYLE[0],
+                       edgecolor=MACHINE_BUSY_STYLE[1],     label="기계: 처리 중 ■"),
+        mpatches.Patch(facecolor=BUFFER_STYLE[0],
+                       edgecolor=BUFFER_STYLE[1],           label="버퍼 ●"),
     ]
-    patches += [
-        mpatches.Patch(facecolor=NODE_COLOR["machine"][0],
-                       edgecolor=NODE_COLOR["machine"][1], label="기계 (▲)"),
-        mpatches.Patch(facecolor=NODE_COLOR["buffer"][0],
-                       edgecolor=NODE_COLOR["buffer"][1],  label="버퍼 (●)"),
-    ]
-    if schedule["use_assembly"]:
-        patches.append(
-            mpatches.Patch(facecolor=NODE_COLOR["assembly"][0],
-                           edgecolor=NODE_COLOR["assembly"][1], label="조립 (■)")
-        )
-    ax.legend(handles=patches, loc="upper right", fontsize=8,
-              prop=kfont if kfont else {})
+    for mid, color in sorted(m_color.items()):
+        patches.append(mpatches.Patch(color=color, label=f"M{mid} 경로"))
+
+    legend_kw = {"prop": kfont} if kfont else {"fontsize": 8}
+    ax.legend(handles=patches, loc="lower right", ncol=2, **legend_kw)
 
 
 # ─────────────────────────────────────────────────────────
 # 통합 시각화 함수
 # ─────────────────────────────────────────────────────────
 
-def draw_flow_graph(G: nx.DiGraph, pos: dict, schedule: dict,
-                    title: str = "", kfont=None) -> plt.Figure:
-    """태림 스타일로 FFSA 스케줄 그래프 시각화"""
-    num_stages = schedule["num_stages"]
-    machines_by_stage = schedule["machines_by_stage"]
-    max_machines = max((len(v) for v in machines_by_stage.values()), default=2)
+def draw_hetero_graph(env, ep: int,
+                      ax=None, title: str = "") -> plt.Figure:
+    """
+    FFSA 이종 그래프 시각화 (태림 스타일).
 
-    fig_w = max(18, num_stages * 3.5 + 4)
-    fig_h = max(8,  max_machines * 2.5)
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    plt.ion() 모드: ax를 넘기면 해당 ax를 지우고 갱신 (Figure 재사용).
+    TensorBoard  : ax=None → 새 Figure 생성 후 반환.
+    """
+    kfont = _init_font()
+    G, pos, active_jobs, m_color = _build_graph_and_pos(env)
+
+    if ax is None:
+        n_jobs    = max(len(active_jobs), 1)
+        n_stages  = env.instance.num_stages
+        fig_w = max(14, n_stages * X_GAP + 4)
+        fig_h = max(8,  n_jobs  * abs(Y_OP_GAP) + 5)
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    else:
+        ax.clear()
+        fig = ax.figure
 
     _draw_edges(G, pos, ax)
     _draw_nodes(G, pos, ax)
-    _draw_labels(G, pos, schedule, kfont, ax)
-    _draw_legend(G, schedule, kfont, ax)
+    _draw_labels(G, pos, env, active_jobs, kfont, ax)
+    _draw_legend(m_color, kfont, ax)
 
-    ax.set_title(title, fontsize=13)
+    wt  = env.get_actual_weighted_tardiness()
+    ms  = env.get_makespan()
+    t   = env.current_time
+    ttl = title or f"[Ep {ep}]  t={t:.1f}  WT={wt:.1f}  MS={ms:.1f}"
+    ax.set_title(ttl, fontsize=12, fontproperties=kfont)
     ax.axis("off")
 
-    # 좌표 범위 (태림과 같은 방식)
-    all_x = [p[0] for p in pos.values()]
-    all_y = [p[1] for p in pos.values()]
-    margin_x, margin_y = 2.0, 2.0
-    ax.set_xlim(min(all_x) - margin_x, max(all_x) + margin_x)
-    ax.set_ylim(min(all_y) - margin_y - 2.0, max(all_y) + margin_y)
+    all_x = [p[0] for p in pos.values()] or [0]
+    all_y = [p[1] for p in pos.values()] or [0]
+    ax.set_xlim(min(all_x) - 2.8, max(all_x) + 2.8)
+    ax.set_ylim(min(all_y) - 1.5, max(all_y) + 2.2)
 
     plt.tight_layout()
     return fig
 
 
-def visualize_schedule(schedule: dict, ep: int = 0,
-                        save_path: Optional[str] = None,
-                        show: bool = False) -> plt.Figure:
-    """에피소드 스케줄 시각화 편의 함수"""
-    kfont = _init_font()
-    G   = build_flow_graph(schedule)
-    pos = get_positions(schedule)
-    wt  = schedule.get("wt", 0.0)
-    ms  = schedule.get("makespan", 0.0)
-    fig = draw_flow_graph(G, pos, schedule,
-                          title=f"[Ep {ep}]  WT={wt:.1f}  |  Makespan={ms:.1f}",
-                          kfont=kfont)
-    if save_path:
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        fig.savefig(save_path, dpi=100, bbox_inches="tight")
-    if show:
-        plt.show()
-    return fig
+# ─────────────────────────────────────────────────────────
+# TensorBoard 로깅
+# ─────────────────────────────────────────────────────────
 
-
-def log_schedule_to_tensorboard(writer, schedule: dict, ep: int):
-    """TensorBoard writer.add_figure()로 스케줄 그래프 로깅"""
-    fig = visualize_schedule(schedule, ep=ep)
-    writer.add_figure("schedule/flow_graph", fig, global_step=ep)
+def log_hetero_graph_to_tensorboard(writer, env, ep: int):
+    """TensorBoard Images 탭에 이종 그래프 기록."""
+    fig = draw_hetero_graph(env, ep)
+    writer.add_figure("graph/hetero_state", fig, global_step=ep)
     plt.close(fig)
