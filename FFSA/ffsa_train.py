@@ -108,14 +108,14 @@ def train(
     logger = Logger(exp_name)
     env = FFSASchedulingEnv(config)
 
-    # ── plt.ion() 실시간 팝업 창 설정 ──
-    plt.ion()
-    n_stages = config.num_stages
-    n_jobs   = config.num_regular_orders + config.num_urgent_orders
-    fig_w = max(14, n_stages * 4.5 + 4)
-    fig_h = max(8,  max(n_jobs, 1) * 1.8 + 5)
-    live_fig, live_ax = plt.subplots(figsize=(fig_w, fig_h))
-    live_fig.canvas.manager.set_window_title(f"FFSA 학습 모니터 [{exp_name}]")
+    # ── plt.ion() 실시간 팝업 창 설정 (보고 싶을 때만 주석 해제) ──
+    # plt.ion()
+    # n_stages = config.num_stages
+    # n_jobs   = config.num_regular_orders + config.num_urgent_orders
+    # fig_w = max(14, n_stages * 4.5 + 4)
+    # fig_h = max(8,  max(n_jobs, 1) * 1.8 + 5)
+    # live_fig, live_ax = plt.subplots(figsize=(fig_w, fig_h))
+    # live_fig.canvas.manager.set_window_title(f"FFSA 학습 모니터 [{exp_name}]")
 
     policy = HGNNPolicy(
         op_feat_dim=10,
@@ -184,12 +184,12 @@ def train(
         episode_deadlocks.append(int(ep_deadlock))
         window_buffer.append((wt, trajectory))
 
-        # ── plt.ion() 실시간 그래프 갱신 ──
-        if ep % viz_interval == 0 or ep == 1:
-            draw_hetero_graph(env, ep, ax=live_ax)
-            live_fig.canvas.draw()
-            live_fig.canvas.flush_events()
-            plt.pause(0.01)
+        # ── plt.ion() 실시간 그래프 갱신 (보고 싶을 때만 주석 해제) ──
+        # if ep % viz_interval == 0 or ep == 1:
+        #     draw_hetero_graph(env, ep, ax=live_ax)
+        #     live_fig.canvas.draw()
+        #     live_fig.canvas.flush_events()
+        #     plt.pause(0.01)
 
         # entropy 지수 감소: 매 에피소드마다 적용
         current_entropy = max(entropy_min, current_entropy * entropy_decay)
@@ -252,8 +252,8 @@ def train(
     plt.close(final_fig)
     print(f"  최종 그래프 저장: {save_path}")
 
-    plt.ioff()
-    plt.close(live_fig)
+    # plt.ioff()
+    # plt.close(live_fig)
     logger.finish()
     return policy, episode_rewards, episode_tardiness, episode_makespans
 
