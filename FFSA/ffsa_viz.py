@@ -41,9 +41,9 @@ NODE_SHAPE = {
     "buffer":    "o",   # 원      ● (태림 buffer 모양)
 }
 NODE_SIZE = {
-    "machine":   1300,
-    "operation": 1700,
-    "buffer":    850,
+    "machine":   800,
+    "operation": 1000,
+    "buffer":    500,
 }
 
 # Op 상태별 (fill, edge_color)
@@ -285,8 +285,8 @@ def _draw_edges(G: nx.DiGraph, pos: dict, ax):
     if prec:
         nx.draw_networkx_edges(
             G, pos, edgelist=prec,
-            edge_color=EDGE_PREC_COLOR, width=1.8,
-            arrows=True, arrowstyle="-|>", arrowsize=18,
+            edge_color=EDGE_PREC_COLOR, width=0.7,
+            arrows=True, arrowstyle="-|>", arrowsize=8,
             connectionstyle="arc3,rad=0.0", ax=ax,
         )
 
@@ -295,7 +295,7 @@ def _draw_edges(G: nx.DiGraph, pos: dict, ax):
     for u, v, d in cand:
         nx.draw_networkx_edges(
             G, pos, edgelist=[(u, v)],
-            edge_color=d["color"], width=1.3, alpha=0.55,
+            edge_color=d["color"], width=0.8, alpha=0.45,
             style="dashed", arrows=False, ax=ax,
         )
 
@@ -304,8 +304,8 @@ def _draw_edges(G: nx.DiGraph, pos: dict, ax):
     for u, v, d in asgn:
         nx.draw_networkx_edges(
             G, pos, edgelist=[(u, v)],
-            edge_color=d["color"], width=3.5,
-            arrows=True, arrowstyle="-|>", arrowsize=20,
+            edge_color=d["color"], width=2.0,
+            arrows=True, arrowstyle="-|>", arrowsize=10,
             ax=ax,
         )
 
