@@ -38,7 +38,7 @@ class HGNNPolicy(nn.Module):
     Stage 1: GAT — (op ↔ machine) candidate edges로 메시지 전달
     Stage 2: Operation MLP — prev/next/machine_mean/self 결합
     Policy Head (일반): MLPπ(op_emb ‖ machine_emb ‖ graph_emb ‖ edge_feat)
-    Policy Head (조립): MLPπ_asm(comp_A_emb ‖ comp_B_emb ‖ machine_emb ‖ graph_emb)
+    Policy Head (조립): MLPπ_asm(mean(comp_embs) ‖ machine_emb ‖ graph_emb)  — 컴포넌트 수 무관
     """
 
     def __init__(
@@ -90,9 +90,9 @@ class HGNNPolicy(nn.Module):
             nn.Linear(64, 1),
         )
 
-        # Policy Head — 조립 action: (comp_A ‖ comp_B ‖ machine ‖ graph) = 3d + 2d
+        # Policy Head — 조립 action: mean(comp_embs) ‖ machine ‖ graph = 4d (컴포넌트 수 무관)
         self.policy_asm_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 5, mlp_hidden),
+            nn.Linear(hidden_dim * 4, mlp_hidden),
             nn.ELU(),
             nn.Linear(mlp_hidden, 64),
             nn.ELU(),
@@ -204,7 +204,7 @@ class HGNNPolicy(nn.Module):
         # 각 action에 대해 logit 계산
         logits = []
         for action in actions:
-            if len(action) == 2:
+            if not isinstance(action[0], tuple):
                 # 일반 action: (op_id, machine_id)
                 op_id, mid = action
                 op_idx = op_id_to_idx.get(op_id)
@@ -218,18 +218,26 @@ class HGNNPolicy(nn.Module):
                 inp = torch.cat([sel_op, sel_m, graph_emb, ef])
                 logits.append(self.policy_mlp(inp.unsqueeze(0)).squeeze())
             else:
-                # 조립 action: (comp_A_job_id, comp_B_job_id, machine_id)
-                comp_a_job, comp_b_job, mid = action
-                # component job의 마지막 active op 임베딩 사용
-                a_idx = self._get_job_last_op_idx(comp_a_job, op_id_to_idx, job_op_map)
-                b_idx = self._get_job_last_op_idx(comp_b_job, op_id_to_idx, job_op_map)
-                if a_idx is None or b_idx is None or mid >= machine_h.size(0):
+                # 조립 action: ((comp_job_id, ...), machine_id)
+                comp_job_ids, mid = action
+                if mid >= machine_h.size(0):
                     logits.append(torch.tensor(-1e9, device=device))
                     continue
-                sel_a = op_h[a_idx] if a_idx < op_h.size(0) else zero_pad.squeeze(0)
-                sel_b = op_h[b_idx] if b_idx < op_h.size(0) else zero_pad.squeeze(0)
+                # 각 컴포넌트의 마지막 op 임베딩 수집 → mean pooling
+                comp_embs = []
+                valid = True
+                for job_id in comp_job_ids:
+                    idx = self._get_job_last_op_idx(job_id, op_id_to_idx, job_op_map)
+                    if idx is None:
+                        valid = False
+                        break
+                    comp_embs.append(op_h[idx] if idx < op_h.size(0) else zero_pad.squeeze(0))
+                if not valid:
+                    logits.append(torch.tensor(-1e9, device=device))
+                    continue
+                comp_pool = torch.stack(comp_embs).mean(dim=0)   # mean pooling → 16d 고정
                 sel_m = machine_h[mid]
-                inp = torch.cat([sel_a, sel_b, sel_m, graph_emb])
+                inp = torch.cat([comp_pool, sel_m, graph_emb])
                 logits.append(self.policy_asm_mlp(inp.unsqueeze(0)).squeeze())
 
         logits = torch.stack(logits)

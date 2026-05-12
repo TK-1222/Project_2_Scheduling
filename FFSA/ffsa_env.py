@@ -28,8 +28,8 @@ from ffsa_instance import (
 )
 
 # Action 타입 정의
-RegularAction = Tuple[int, int]           # (op_id, machine_id)
-AssemblyAction = Tuple[int, int, int]     # (comp_A_job_id, comp_B_job_id, machine_id)
+RegularAction = Tuple[int, int]                    # (op_id, machine_id)
+AssemblyAction = Tuple[Tuple[int, ...], int]       # ((comp_job_id, ...), machine_id)
 Action = Union[RegularAction, AssemblyAction]
 
 
@@ -410,7 +410,8 @@ class FFSASchedulingEnv(gym.Env):
         for unit_idx in range(qty):
             if cfg.use_assembly:
                 # component jobs
-                for comp_type in range(cfg.components_per_product):
+                num_comp = self.instance.products[p].num_components
+                for comp_type in range(num_comp):
                     job = JobData(
                         job_id=new_jid, product_id=p, order_id=new_oid,
                         arrival_time=t, route=list(pre_asm),
@@ -533,7 +534,7 @@ class FFSASchedulingEnv(gym.Env):
         action = actions[action_idx]
         self._deadlock_detected = False
 
-        if len(action) == 3:
+        if isinstance(action[0], tuple):
             self._dispatch_assembly(*action)
         else:
             self._dispatch(*action)
@@ -582,18 +583,15 @@ class FFSASchedulingEnv(gym.Env):
         ms.current_op = op_id
         ms.remaining_time = total
 
-    def _dispatch_assembly(self, comp_a_job_id: int, comp_b_job_id: int, machine_id: int):
+    def _dispatch_assembly(self, comp_job_ids: Tuple[int, ...], machine_id: int):
         """조립 dispatch: 컴포넌트 소비 → final job 활성화 → 조립 op 시작"""
-        comp_a_job = self.instance.jobs[comp_a_job_id]
-        comp_b_job = self.instance.jobs[comp_b_job_id]
-        product_id = comp_a_job.product_id
+        product_id = self.instance.jobs[comp_job_ids[0]].product_id
         asm_stage = self.instance.config.assembly_stage_idx
 
-        # pool에서 컴포넌트 소비
-        a_type = comp_a_job.component_type_idx
-        b_type = comp_b_job.component_type_idx
-        self.assembly_pool[product_id][a_type].remove(comp_a_job_id)
-        self.assembly_pool[product_id][b_type].remove(comp_b_job_id)
+        # pool에서 컴포넌트 소비 (가변 개수)
+        for job_id in comp_job_ids:
+            comp_type = self.instance.jobs[job_id].component_type_idx
+            self.assembly_pool[product_id][comp_type].remove(job_id)
 
         # 미활성 final job 활성화
         final_job_id = self.inactive_final_jobs[product_id].pop(0)
@@ -790,9 +788,13 @@ class FFSASchedulingEnv(gym.Env):
         """조립 가능 (comp_A, comp_B, machine) 조합 반환"""
         actions = []
         asm_stage = self.instance.config.assembly_stage_idx
-        num_types = self.instance.config.components_per_product
 
         for prod_id, type_pool in self.assembly_pool.items():
+            # 제품별 컴포넌트 수 조회
+            num_types = self.instance.products[prod_id].num_components
+            # 컴포넌트가 1개 이하면 조립 불필요
+            if num_types < 2:
+                continue
             # 모든 타입이 pool에 ≥1개 존재해야 조립 가능
             if len(type_pool) < num_types:
                 continue
@@ -812,13 +814,12 @@ class FFSASchedulingEnv(gym.Env):
             if not asm_machines:
                 continue
 
-            # 타입 0(A)과 타입 1(B)의 모든 조합 (components_per_product=2 가정)
-            # 일반화: 타입 0 × 타입 1 × ... × 타입 (n-1)
+            # 타입 0 × 타입 1 × ... × 타입 (num_types-1) 모든 조합
             from itertools import product as iterproduct
             type_lists = [type_pool[t] for t in range(num_types)]
             for combo in iterproduct(*type_lists):
                 for mid in asm_machines:
-                    actions.append((*combo, mid))
+                    actions.append((combo, mid))   # ((comp1, comp2, ...), machine_id)
 
         return actions
 

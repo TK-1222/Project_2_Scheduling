@@ -24,7 +24,7 @@ import numpy as np
 class InstanceConfig:
     """FFSA 인스턴스 생성 설정"""
     num_products: int = 4
-    components_per_product: int = 2
+    components_range: Tuple[int, int] = (2, 3)   # 제품별 컴포넌트 수 유니폼 분포 [min, max]
     num_stages: int = 6
     assembly_stage_idx: int = 3
     machines_per_stage: Optional[List[int]] = field(default_factory=lambda: [2, 2, 2, 2, 2, 2])
@@ -70,6 +70,7 @@ class ProductData:
     """제품 정보 (PPT: p ∈ P)"""
     product_id: int
     weight: float              # wp (tardiness 가중치)
+    num_components: int = 2    # 조립에 필요한 컴포넌트 수 (제품마다 다름)
 
 
 @dataclass
@@ -139,9 +140,14 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
     # ── 제품 생성 ──
     products: Dict[int, ProductData] = {}
     for p in range(config.num_products):
+        num_comp = (
+            int(rng.randint(config.components_range[0], config.components_range[1] + 1))
+            if config.use_assembly else 1
+        )
         products[p] = ProductData(
             product_id=p,
             weight=float(rng.uniform(*config.weight_range)),
+            num_components=num_comp,
         )
 
     # ── 주문 생성 ──
@@ -171,7 +177,8 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
 
         for order in orders.values():
             for unit_idx in range(order.quantity):
-                for comp_type in range(config.components_per_product):
+                num_comp = products[order.product_id].num_components
+                for comp_type in range(num_comp):
                     jobs[jid] = JobData(
                         job_id=jid,
                         product_id=order.product_id,
