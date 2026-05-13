@@ -897,37 +897,11 @@ class FFSASchedulingEnv(gym.Env):
     # ──────────────────────────────────────────────────────
 
     def _reward_fn(self) -> float:
-        """r = -Δ(tardiness) + slack 중간 보상
-        operation 완료 시마다 납기까지 남은 여유(slack)에 비례한 보상 추가.
-        에이전트가 '빨리 처리할수록 좋다'는 신호를 매 스텝 받을 수 있게 함.
-        """
+        """r = -Δ(weighted tardiness)"""
         current_wt = self._compute_actual_weighted_tardiness()
         delta = current_wt - self._prev_actual_wt
         self._prev_actual_wt = current_wt
-
-        slack_reward = self._compute_slack_reward()
-        return -delta + slack_reward
-
-    def _compute_slack_reward(self) -> float:
-        """방금 완료된 operation에 대해 slack 기반 중간 보상 계산
-        slack = due_date - current_time (양수면 납기 여유 있음)
-        보상 = weight * slack / max_due * 0.1  (tardiness 보상과 스케일 맞춤)
-        """
-        max_due = self.graph_builder.max_due or 1.0
-        reward = 0.0
-        for op in self.operations.values():
-            if not op.active or not op.is_done:
-                continue
-            if op.completion_time is None or op.completion_time < self.current_time - 1e-9:
-                continue
-            # 방금 완료된 op (completion_time ≈ current_time)
-            if abs(op.completion_time - self.current_time) > 1e-6:
-                continue
-            job = self.instance.jobs[op.job_id]
-            weight = self.instance.products[op.product_id].weight
-            slack = job.due_date - self.current_time
-            reward += weight * slack / max_due * 0.1
-        return reward
+        return -delta
 
     def _compute_actual_weighted_tardiness(self) -> float:
         """완료된 final job에 대해 주문 납기 기준 tardiness 합산"""

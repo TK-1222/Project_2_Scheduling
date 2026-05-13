@@ -140,13 +140,11 @@ def train(
         obs, _ = env.reset()
         done = False
         total_reward = 0.0
-        steps = 0
-        max_steps = env.num_operations * 10
         ep_deadlock = False
         trajectory = []
 
         with torch.no_grad():
-            while not done and steps < max_steps:
+            while not done:
                 if not obs["actions"]:
                     break
 
@@ -156,10 +154,11 @@ def train(
                 trajectory.append((obs, action, log_prob, reward, value, done or truncated))
                 total_reward += reward
                 obs = next_obs
-                steps += 1
 
                 if info.get("deadlock"):
                     ep_deadlock = True
+                    trajectory.append((obs, 0, 0.0, -1000.0, 0.0, True))
+                    total_reward += -1000.0
                     break
 
         wt = env.get_actual_weighted_tardiness()
@@ -207,7 +206,7 @@ def train(
             dl_str  = f" | DL={avg_dl:.1f}" if avg_dl > 0 else ""
             upd_str = " | [UPDATE]" if policy_updated else ""
             print(
-                f"[Ep {ep:4d}] steps={steps:4d} | "
+                f"[Ep {ep:4d}] "
                 f"reward={total_reward:8.2f} (avg={avg_r:8.2f}) | "
                 f"WT={wt:8.2f} (avg={avg_wt:8.2f}) | "
                 f"MS={ms:8.1f} (avg={avg_ms:8.1f}) | "
@@ -246,24 +245,21 @@ def test_random_agent(config: InstanceConfig, num_episodes: int = 5):
         obs, _ = env.reset()
         done = False
         total_reward = 0.0
-        steps = 0
-        max_steps = env.num_operations * 10
 
-        while not done and steps < max_steps:
+        while not done:
             actions = obs["actions"]
             if not actions:
                 break
             action = int(np.random.randint(len(actions)))
             obs, reward, done, truncated, info = env.step(action)
             total_reward += reward
-            steps += 1
 
         wt = env.get_actual_weighted_tardiness()
         ms = env.get_makespan()
         completed = info.get("completed_ops", 0)
         total_ops = info.get("total_ops", 0)
         print(
-            f"[Ep {ep}] steps={steps} | reward={total_reward:.2f} | "
+            f"[Ep {ep}] reward={total_reward:.2f} | "
             f"WT={wt:.2f} | MS={ms:.1f} | "
             f"completed={completed}/{total_ops} | done={done}"
         )
