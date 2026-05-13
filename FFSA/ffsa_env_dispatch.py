@@ -1,14 +1,13 @@
 """
-FFSA 스케줄링 강화학습 환경
-============================
-PPT 04장: 제약식 C1~C10 → action mask + DES 로직
-PPT 05장: MDP 정의, State (이종 그래프), Action, Reward
+FFSA 스케줄링 강화학습 환경 (디스패칭 룰 버전)
+================================================
+ffsa_env.py 와 동일하나 _get_valid_action_pairs()를
+FIFO / EDD / MWKR 디스패칭 룰 기반 후보 생성으로 대체.
 
-조립 방식: pool 기반 동적 페어링
-  - component job 완료 → 조립 stage 버퍼(pool)에 진입
-  - 버퍼에 A타입 ≥1, B타입 ≥1 존재 시 조립 가능
-  - 에이전트가 (comp_A_job_id, comp_B_job_id, machine_id) 선택
-  - 선택된 컴포넌트 소비 → 미활성 final job 활성화 → 조립 공정 시작
+각 룰이 ready op 중 1개를 선택 → 최소 처리시간 기계와 페어링
+→ 중복 제거 후 최대 3개 후보를 GNN에 전달.
+룰이 후보를 못 찾으면 전체 유효 액션 fallback.
+조립 actions는 항상 포함.
 
 Reward: r = -Δ(실제 완료된 주문의 가중 지연)
 """
@@ -823,18 +822,101 @@ class FFSASchedulingEnv(gym.Env):
 
         return actions
 
-    def _get_valid_action_pairs(self) -> List[Action]:
-        pairs: List[Action] = []
-        # 일반 op actions
-        for op in self.operations.values():
-            if not op.active or not op.is_ready:
+    # ──────────────────────────────────────────────────────
+    # Dispatching Rules
+    # ──────────────────────────────────────────────────────
+
+    def _remaining_work(self, op: OperationState) -> float:
+        """MWKR용: job의 미완료 op 최소 처리시간 합산"""
+        total = 0.0
+        for oid in self.job_ops[op.job_id]:
+            o = self.operations[oid]
+            if o.is_done or o.is_processing:
                 continue
-            for mid in self.instance.machines_by_stage.get(op.stage_id, []):
-                if self._is_valid_regular_action(op.op_id, mid):
-                    pairs.append((op.op_id, mid))
-        # 조립 actions
-        pairs.extend(self._get_valid_assembly_actions())
-        return pairs
+            times = [
+                self.instance.processing_times.get((op.job_id, o.stage_id, mid), 0.0)
+                for mid in self.instance.machines_by_stage.get(o.stage_id, [])
+                if o.product_id in self.instance.machines[mid].compatible_products
+            ]
+            total += min(times) if times else 0.0
+        return total
+
+    def _best_machine_for_op(self, op: OperationState) -> Optional[int]:
+        """유휴 호환 기계 중 처리시간 최소 기계 반환"""
+        best_mid: Optional[int] = None
+        best_t = float('inf')
+        for mid in self.instance.machines_by_stage.get(op.stage_id, []):
+            if not self._is_valid_regular_action(op.op_id, mid):
+                continue
+            t = self.instance.processing_times.get((op.job_id, op.stage_id, mid), float('inf'))
+            if t < best_t:
+                best_t = t
+                best_mid = mid
+        return best_mid
+
+    def _apply_fifo(self) -> Optional[Action]:
+        """FIFO: 가장 일찍 도착한 job의 ready op 선택"""
+        ready = [
+            op for op in self.operations.values()
+            if op.active and op.is_ready and not op.is_processing and not op.is_assembly
+        ]
+        ready.sort(key=lambda op: self.instance.jobs[op.job_id].arrival_time)
+        for op in ready:
+            mid = self._best_machine_for_op(op)
+            if mid is not None:
+                return (op.op_id, mid)
+        return None
+
+    def _apply_edd(self) -> Optional[Action]:
+        """EDD: 납기가 가장 빠른 job의 ready op 선택"""
+        ready = [
+            op for op in self.operations.values()
+            if op.active and op.is_ready and not op.is_processing and not op.is_assembly
+        ]
+        ready.sort(key=lambda op: self.instance.jobs[op.job_id].due_date)
+        for op in ready:
+            mid = self._best_machine_for_op(op)
+            if mid is not None:
+                return (op.op_id, mid)
+        return None
+
+    def _apply_mwkr(self) -> Optional[Action]:
+        """MWKR: 잔여 작업량이 가장 큰 job의 ready op 선택"""
+        ready = [
+            op for op in self.operations.values()
+            if op.active and op.is_ready and not op.is_processing and not op.is_assembly
+        ]
+        ready.sort(key=lambda op: self._remaining_work(op), reverse=True)
+        for op in ready:
+            mid = self._best_machine_for_op(op)
+            if mid is not None:
+                return (op.op_id, mid)
+        return None
+
+    def _get_valid_action_pairs(self) -> List[Action]:
+        # 각 디스패칭 룰이 후보 1개씩 생성, 중복 제거
+        regular_candidates: List[Action] = []
+        seen: set = set()
+
+        for action in [self._apply_fifo(), self._apply_edd(), self._apply_mwkr()]:
+            if action is not None and action not in seen:
+                regular_candidates.append(action)
+                seen.add(action)
+
+        # 룰이 후보를 못 찾으면 전체 유효 액션 fallback
+        if not regular_candidates:
+            for op in self.operations.values():
+                if not op.active or not op.is_ready:
+                    continue
+                for mid in self.instance.machines_by_stage.get(op.stage_id, []):
+                    if self._is_valid_regular_action(op.op_id, mid):
+                        a: Action = (op.op_id, mid)
+                        if a not in seen:
+                            regular_candidates.append(a)
+                            seen.add(a)
+
+        # 조립 actions 항상 포함
+        return regular_candidates + self._get_valid_assembly_actions()
 
     def _has_valid_action(self) -> bool:
         for op in self.operations.values():
