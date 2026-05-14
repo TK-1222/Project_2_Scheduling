@@ -1,15 +1,16 @@
 """
-FFSA 학습 루프 — Window 기반 Best-Trajectory DQN
-=================================================
-PPT Slide 13: 단계적 실험 전략
-  Step 1: 단순 FFSA (assembly 없음)
-  Step 2: Assembly 포함
-  Step 3: Setup + Buffer
+FFSA 학습 루프 — Dual Q-Network (GNN 방식)
+==========================================
+RegularQNetwork + AssemblyQNetwork 듀얼 에이전트 학습.
 
-학습 방식: Window 기반 Best-Trajectory DQN
-  - window_size 에피소드 수집, 정책 고정 (ε-greedy 탐색)
-  - window 종료 시 WT 최소 에피소드의 trajectory로 TD loss → online Q-network 업데이트
-  - target_update_cycles 번 업데이트마다 target ← online 가중치 복사
+업데이트 스케줄 (엇갈린 Window Best-Trajectory):
+  - Regular : ep 5, 10, 15 … window 내 WT 최소 trajectory로 업데이트
+  - Assembly: ep 6, 11, 16 … Regular 보다 1 에피소드 늦게 업데이트
+  - Target  : 각 네트워크 독립적으로 2 update cycle마다 업데이트
+
+네트워크 간 정보 교환:
+  - C_p (Regular → Assembly): GNN 임베딩 평균 + pool 상태 3 스칼라
+  - U_p (Assembly → Regular): GNN 임베딩 평균 + 긴급도 3 스칼라
 
 모니터링: TensorBoard
   tensorboard --logdir runs/
@@ -22,7 +23,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from ffsa_instance import InstanceConfig, simple_config, assembly_config, full_config
 from ffsa_env import FFSASchedulingEnv
-from ffsa_model import HGNNQNetwork, DQNAgent
+from ffsa_model import RegularQNetwork, AssemblyQNetwork, DualDQNAgent
 from ffsa_viz import log_hetero_graph_to_tensorboard
 
 
@@ -42,19 +43,29 @@ class Logger:
         self.writer.add_scalar("episode/deadlock", int(deadlock), ep)
         self.writer.add_scalar("train/epsilon", epsilon, ep)
 
-    def log_window(self, ep: int, metrics: dict, best_wt: float,
-                   window_wt_list: list, target_updated: bool):
-        self.writer.add_scalar("train/loss",             metrics.get("loss", 0),         ep)
-        self.writer.add_scalar("train/best_wt_in_window", best_wt,                        ep)
-        self.writer.add_scalar("train/mean_wt_in_window", float(np.mean(window_wt_list)), ep)
-        self.writer.add_scalar("train/worst_wt_in_window",float(np.max(window_wt_list)),  ep)
-        self.writer.add_scalar("train/target_updated",   int(target_updated),             ep)
+    def log_window_reg(self, ep: int, metrics: dict, best_wt: float,
+                       wt_list: list, target_updated: bool):
+        self.writer.add_scalar("train/reg_loss",           metrics.get("loss_reg", 0), ep)
+        self.writer.add_scalar("train/reg_best_wt",        best_wt,                    ep)
+        self.writer.add_scalar("train/reg_mean_wt",        float(np.mean(wt_list)),    ep)
+        self.writer.add_scalar("train/reg_target_updated", int(target_updated),         ep)
 
-    def log_weights(self, ep: int, net: torch.nn.Module):
-        for name, param in net.named_parameters():
-            self.writer.add_histogram(f"weights/{name}", param.data, ep)
+    def log_window_asm(self, ep: int, metrics: dict, best_wt: float,
+                       wt_list: list, target_updated: bool):
+        self.writer.add_scalar("train/asm_loss",           metrics.get("loss_asm", 0), ep)
+        self.writer.add_scalar("train/asm_best_wt",        best_wt,                    ep)
+        self.writer.add_scalar("train/asm_mean_wt",        float(np.mean(wt_list)),    ep)
+        self.writer.add_scalar("train/asm_target_updated", int(target_updated),         ep)
+
+    def log_weights(self, ep: int, reg_net: torch.nn.Module, asm_net: torch.nn.Module):
+        for name, param in reg_net.named_parameters():
+            self.writer.add_histogram(f"weights/reg/{name}", param.data, ep)
             if param.grad is not None:
-                self.writer.add_histogram(f"grads/{name}", param.grad, ep)
+                self.writer.add_histogram(f"grads/reg/{name}", param.grad, ep)
+        for name, param in asm_net.named_parameters():
+            self.writer.add_histogram(f"weights/asm/{name}", param.data, ep)
+            if param.grad is not None:
+                self.writer.add_histogram(f"grads/asm/{name}", param.grad, ep)
 
     def finish(self):
         self.writer.close()
@@ -78,10 +89,10 @@ def train(
     device: str = "cpu",
     log_interval: int = 10,
     hist_interval: int = 100,
-    exp_name: str = "ffsa_dqn",
+    exp_name: str = "ffsa_dual_dqn",
 ):
     print(f"{'='*60}")
-    print(f"FFSA 스케줄링 DQN 학습 시작  [{exp_name}]")
+    print(f"FFSA Dual DQN 학습 시작  [{exp_name}]")
     print(f"  제품 수: {config.num_products}")
     print(f"  Stage 수: {config.num_stages}")
     print(f"  정규주문: {config.num_regular_orders}건")
@@ -90,6 +101,8 @@ def train(
     print(f"  Setup: {config.use_setup}")
     print(f"  유한 버퍼: {config.use_finite_buffer}")
     print(f"  Episodes: {num_episodes}  |  Window: {window_size}")
+    print(f"  Regular 업데이트: ep {window_size}, {window_size*2}, ...")
+    print(f"  Assembly 업데이트: ep {window_size+1}, {window_size*2+1}, ...")
     print(f"  Target 업데이트: {target_update_cycles} 업데이트 사이클마다")
     print(f"  ε: {epsilon_start} → {epsilon_min} (decay={epsilon_decay})")
     print(f"  TensorBoard: runs/{exp_name}")
@@ -98,22 +111,18 @@ def train(
     logger = Logger(exp_name)
     env    = FFSASchedulingEnv(config)
 
-    q_net = HGNNQNetwork(
-        op_feat_dim=10,
-        machine_feat_dim=6,
-        edge_feat_dim=2,
-        hidden_dim=hidden_dim,
-        num_layers=2,
-        mlp_hidden=128,
+    reg_net = RegularQNetwork(
+        op_feat_dim=10, machine_feat_dim=6, edge_feat_dim=2,
+        hidden_dim=hidden_dim, num_layers=2, mlp_hidden=128,
     )
-
-    agent = DQNAgent(
-        q_net=q_net,
-        lr=lr,
-        gamma=gamma,
-        epsilon_start=epsilon_start,
-        epsilon_min=epsilon_min,
-        epsilon_decay=epsilon_decay,
+    asm_net = AssemblyQNetwork(
+        op_feat_dim=10, machine_feat_dim=6, edge_feat_dim=2,
+        hidden_dim=hidden_dim, num_layers=2, mlp_hidden=128,
+    )
+    agent = DualDQNAgent(
+        reg_net=reg_net, asm_net=asm_net,
+        lr=lr, gamma=gamma,
+        epsilon_start=epsilon_start, epsilon_min=epsilon_min, epsilon_decay=epsilon_decay,
         device=device,
     )
 
@@ -122,9 +131,12 @@ def train(
     episode_makespans = []
     episode_deadlocks = []
 
-    window_buffer: list = []   # (wt, trajectory) 저장
-    metrics:       dict = {}
-    update_cycle:  int  = 0
+    reg_window_buffer: list = []
+    asm_window_buffer: list = []
+    reg_update_cycle: int   = 0
+    asm_update_cycle: int   = 0
+    metrics_reg: dict = {}
+    metrics_asm: dict = {}
 
     for ep in range(1, num_episodes + 1):
         obs, _ = env.reset()
@@ -157,48 +169,64 @@ def train(
         episode_tardiness.append(wt)
         episode_makespans.append(ms)
         episode_deadlocks.append(int(ep_deadlock))
-        window_buffer.append((wt, trajectory))
+
+        reg_window_buffer.append((wt, trajectory))
+        asm_window_buffer.append((wt, trajectory))
 
         agent.decay_epsilon()
         logger.log_episode(ep, wt, ms, total_reward, ep_deadlock, agent.epsilon)
 
-        # window 종료: WT 최소 trajectory로 online 업데이트
-        policy_updated  = False
-        target_updated  = False
+        # ── Regular 업데이트: ep 5, 10, 15 …
+        reg_updated        = False
+        reg_target_updated = False
         if ep % window_size == 0:
-            window_wt_list          = [x[0] for x in window_buffer]
-            best_wt, best_traj      = min(window_buffer, key=lambda x: x[0])
+            reg_wt_list            = [x[0] for x in reg_window_buffer]
+            best_wt_r, best_traj_r = min(reg_window_buffer, key=lambda x: x[0])
+            metrics_reg            = agent.update_regular(best_traj_r)
+            reg_window_buffer      = []
+            reg_update_cycle      += 1
+            reg_updated            = True
+            if reg_update_cycle % target_update_cycles == 0:
+                agent.update_regular_target()
+                reg_target_updated = True
+            logger.log_window_reg(ep, metrics_reg, best_wt_r, reg_wt_list, reg_target_updated)
 
-            metrics      = agent.update_from_trajectory(best_traj)
-            window_buffer = []
-            update_cycle += 1
-            policy_updated = True
-
-            # target 업데이트 주기 확인
-            if update_cycle % target_update_cycles == 0:
-                agent.update_target()
-                target_updated = True
-
-            logger.log_window(ep, metrics, best_wt, window_wt_list, target_updated)
+        # ── Assembly 업데이트: ep 6, 11, 16 …
+        asm_updated        = False
+        asm_target_updated = False
+        if ep % window_size == 1 and ep >= window_size + 1:
+            asm_wt_list            = [x[0] for x in asm_window_buffer]
+            best_wt_a, best_traj_a = min(asm_window_buffer, key=lambda x: x[0])
+            metrics_asm            = agent.update_assembly(best_traj_a)
+            asm_window_buffer      = []
+            asm_update_cycle      += 1
+            asm_updated            = True
+            if asm_update_cycle % target_update_cycles == 0:
+                agent.update_assembly_target()
+                asm_target_updated = True
+            logger.log_window_asm(ep, metrics_asm, best_wt_a, asm_wt_list, asm_target_updated)
 
         if ep % hist_interval == 0:
-            logger.log_weights(ep, agent.online_net)
+            logger.log_weights(ep, agent.reg_online, agent.asm_online)
 
         if ep % log_interval == 0 or ep == 1:
             avg_r  = np.mean(episode_rewards[-log_interval:])
             avg_wt = np.mean(episode_tardiness[-log_interval:])
             avg_ms = np.mean(episode_makespans[-log_interval:])
             avg_dl = np.mean(episode_deadlocks[-log_interval:])
-            loss_str = f"loss={metrics.get('loss', 0):.4f}" if metrics else "no update"
+            reg_loss = f"reg={metrics_reg.get('loss_reg', 0):.4f}" if metrics_reg else "reg=--"
+            asm_loss = f"asm={metrics_asm.get('loss_asm', 0):.4f}" if metrics_asm else "asm=--"
             dl_str   = f" | DL={avg_dl:.1f}" if avg_dl > 0 else ""
-            upd_str  = " | [UPDATE]" if policy_updated else ""
-            tgt_str  = "[TARGET]" if target_updated else ""
+            upd_str  = ""
+            if reg_updated:            upd_str += " [REG]"
+            if asm_updated:            upd_str += " [ASM]"
+            if reg_target_updated or asm_target_updated: upd_str += " [TGT]"
             print(
                 f"[Ep {ep:4d}] "
                 f"reward={total_reward:8.2f} (avg={avg_r:8.2f}) | "
                 f"WT={wt:8.2f} (avg={avg_wt:8.2f}) | "
                 f"MS={ms:8.1f} (avg={avg_ms:8.1f}) | "
-                f"ε={agent.epsilon:.3f} | {loss_str}{dl_str}{upd_str}{tgt_str}"
+                f"ε={agent.epsilon:.3f} | {reg_loss} {asm_loss}{dl_str}{upd_str}"
             )
 
     print(f"\n{'='*60}")
@@ -214,7 +242,7 @@ def train(
     print(f"  최종 그래프 TensorBoard 저장 완료 (graph/hetero_state)")
 
     logger.finish()
-    return agent.online_net, episode_rewards, episode_tardiness, episode_makespans
+    return agent, episode_rewards, episode_tardiness, episode_makespans
 
 
 # ──────────────────────────────────────────────────────────
@@ -255,7 +283,7 @@ def test_random_agent(config: InstanceConfig, num_episodes: int = 5):
 # ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="FFSA 스케줄링 DQN 학습")
+    parser = argparse.ArgumentParser(description="FFSA Dual DQN 학습")
     parser.add_argument("--step",                  type=int,   default=1, choices=[1, 2, 3])
     parser.add_argument("--episodes",              type=int,   default=300)
     parser.add_argument("--window",                type=int,   default=5)
@@ -273,7 +301,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     step_name = {1: "simple", 2: "assembly", 3: "full"}[args.step]
-    exp_name  = args.exp_name or f"dqn_{step_name}_w{args.window}_lr{args.lr}"
+    exp_name  = args.exp_name or f"dual_dqn_{step_name}_w{args.window}_lr{args.lr}"
 
     if args.step == 1:
         config = simple_config(num_products=args.products)
