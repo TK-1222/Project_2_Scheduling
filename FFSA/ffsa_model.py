@@ -7,18 +7,16 @@ HGNN Q-Network + DQN Agent
   Q-Head:  MLP_Q(op_emb ‖ machine_emb ‖ graph_emb ‖ edge_feat) → Q(s,a)
            조립 action: MLP_Q_asm(mean(comp_embs) ‖ machine_emb ‖ graph_emb) → Q(s,a)
 
-학습: DQN
-  online Q-network: 매 스텝 TD 오차로 업데이트
-  target Q-network: 주기적으로 online 가중치 복사 (학습 안정화)
+학습: Window 기반 Best-Trajectory DQN
+  - window_size 에피소드 수집 → WT 최소 에피소드 trajectory 선택
+  - 선택된 trajectory로 TD loss → online Q-network 업데이트
+  - target_update_cycles 업데이트마다 target ← online 가중치 복사
   탐색: ε-greedy (ε 지수 감소)
 """
 
 import copy
-import random
-from collections import deque
 from typing import Dict, List, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -53,11 +51,9 @@ class HGNNQNetwork(nn.Module):
         self.num_layers = num_layers
         self.edge_feat_dim = edge_feat_dim
 
-        # Input projections
-        self.op_encoder = nn.Linear(op_feat_dim, hidden_dim)
+        self.op_encoder      = nn.Linear(op_feat_dim, hidden_dim)
         self.machine_encoder = nn.Linear(machine_feat_dim, hidden_dim)
 
-        # Stage 1: GAT (op ↔ machine)
         self.gat_op2m = nn.ModuleList([
             GATConv((hidden_dim, hidden_dim), hidden_dim,
                     edge_dim=edge_feat_dim, add_self_loops=False)
@@ -69,17 +65,13 @@ class HGNNQNetwork(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # Stage 2: Operation Embedding MLP
         self.theta1 = nn.Linear(hidden_dim, hidden_dim)
         self.theta2 = nn.Linear(hidden_dim, hidden_dim)
         self.theta3 = nn.Linear(hidden_dim, hidden_dim)
         self.theta4 = nn.Linear(hidden_dim, hidden_dim)
-        self.theta0 = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim),
-            nn.ELU(),
-        )
+        self.theta0 = nn.Sequential(nn.Linear(hidden_dim * 4, hidden_dim), nn.ELU())
 
-        # Q-value Head — 일반 action: (op ‖ machine ‖ graph ‖ edge) = 4d + edge_dim
+        # Q-value Head — 일반 action
         self.q_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 4 + edge_feat_dim, mlp_hidden),
             nn.ELU(),
@@ -88,7 +80,7 @@ class HGNNQNetwork(nn.Module):
             nn.Linear(64, 1),
         )
 
-        # Q-value Head — 조립 action: mean(comp_embs) ‖ machine ‖ graph = 4d
+        # Q-value Head — 조립 action
         self.q_asm_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 4, mlp_hidden),
             nn.ELU(),
@@ -105,19 +97,16 @@ class HGNNQNetwork(nn.Module):
         op_id_to_idx: Dict[int, int],
         job_op_map: Dict[int, List[int]],
     ) -> torch.Tensor:
-        """
-        Returns:
-            q_values: shape [num_actions] — 각 후보 action의 Q(s,a)
-        """
+        """Returns: q_values shape [num_actions]"""
         device = next(self.parameters()).device
 
-        op_x = graph_data['op'].x.to(device)
+        op_x      = graph_data['op'].x.to(device)
         machine_x = graph_data['machine'].x.to(device)
 
         if op_x.size(0) == 0 or not actions:
             return torch.zeros(max(len(actions), 1), device=device)
 
-        op_h = self.op_encoder(op_x)
+        op_h      = self.op_encoder(op_x)
         machine_h = self.machine_encoder(machine_x)
 
         cand_edge = graph_data['op', 'candidate', 'machine'].edge_index.to(device)
@@ -125,41 +114,33 @@ class HGNNQNetwork(nn.Module):
         rev_edge  = graph_data['machine', 'candidate_rev', 'op'].edge_index.to(device)
         rev_attr  = graph_data['machine', 'candidate_rev', 'op'].edge_attr.to(device)
 
-        # Stage 1: GAT
         for i in range(self.num_layers):
             if cand_edge.size(1) > 0:
                 machine_h = F.elu(self.gat_op2m[i]((op_h, machine_h), cand_edge, edge_attr=cand_attr) + machine_h)
             if rev_edge.size(1) > 0:
                 op_h = F.elu(self.gat_m2o[i]((machine_h, op_h), rev_edge, edge_attr=rev_attr) + op_h)
 
-        # Stage 2: Operation Embedding
-        prev_map = precedence_info['prev_map']
-        next_map = precedence_info['next_map']
+        prev_map         = precedence_info['prev_map']
+        next_map         = precedence_info['next_map']
         candidate_machines = precedence_info['candidate_machines']
-        num_ops = op_h.size(0)
-
-        zero_pad    = torch.zeros((1, self.hidden_dim), device=device)
-        op_h_padded = torch.cat([op_h, zero_pad], dim=0)
+        num_ops          = op_h.size(0)
+        zero_pad         = torch.zeros((1, self.hidden_dim), device=device)
+        op_h_padded      = torch.cat([op_h, zero_pad], dim=0)
 
         sorted_op_ids = sorted(op_id_to_idx, key=op_id_to_idx.get)
         prev_idx = torch.tensor(
             [op_id_to_idx.get(prev_map.get(oid), num_ops) if prev_map.get(oid) is not None else num_ops
-             for oid in sorted_op_ids],
-            dtype=torch.long, device=device,
-        )
+             for oid in sorted_op_ids], dtype=torch.long, device=device)
         next_idx = torch.tensor(
             [op_id_to_idx.get(next_map.get(oid), num_ops) if next_map.get(oid) is not None else num_ops
-             for oid in sorted_op_ids],
-            dtype=torch.long, device=device,
-        )
+             for oid in sorted_op_ids], dtype=torch.long, device=device)
 
         prev_h = op_h_padded[prev_idx]
         next_h = op_h_padded[next_idx]
 
         machine_mean = torch.zeros((num_ops, self.hidden_dim), device=device)
         for op_id, idx in op_id_to_idx.items():
-            cand_m = candidate_machines.get(op_id, [])
-            valid_m = [m for m in cand_m if m < machine_h.size(0)]
+            valid_m = [m for m in candidate_machines.get(op_id, []) if m < machine_h.size(0)]
             if valid_m:
                 machine_mean[idx] = machine_h[valid_m].mean(dim=0)
 
@@ -170,32 +151,26 @@ class HGNNQNetwork(nn.Module):
             F.elu(self.theta4(op_h)),
         ], dim=-1))
 
-        # Graph pooling
-        graph_emb = torch.cat([op_h.mean(dim=0), machine_h.mean(dim=0)])
-
+        graph_emb    = torch.cat([op_h.mean(dim=0), machine_h.mean(dim=0)])
         edge_feat_map = self._build_edge_feat_map(graph_data, device)
 
-        # 각 action의 Q(s,a) 계산
         q_vals = []
         for action in actions:
             if not isinstance(action[0], tuple):
-                # 일반 action: (op_id, machine_id)
                 op_id, mid = action
                 op_idx = op_id_to_idx.get(op_id)
                 if op_idx is None or op_idx >= op_h.size(0) or mid >= machine_h.size(0):
                     q_vals.append(torch.tensor(-1e9, device=device))
                     continue
-                ef = edge_feat_map.get((op_idx, mid), torch.zeros(self.edge_feat_dim, device=device))
+                ef  = edge_feat_map.get((op_idx, mid), torch.zeros(self.edge_feat_dim, device=device))
                 inp = torch.cat([op_h[op_idx], machine_h[mid], graph_emb, ef])
                 q_vals.append(self.q_mlp(inp.unsqueeze(0)).squeeze())
             else:
-                # 조립 action: ((comp_job_id, ...), machine_id)
                 comp_job_ids, mid = action
                 if mid >= machine_h.size(0):
                     q_vals.append(torch.tensor(-1e9, device=device))
                     continue
-                comp_embs = []
-                valid = True
+                comp_embs, valid = [], True
                 for job_id in comp_job_ids:
                     idx = self._get_job_last_op_idx(job_id, op_id_to_idx, job_op_map)
                     if idx is None:
@@ -211,41 +186,19 @@ class HGNNQNetwork(nn.Module):
 
         return torch.stack(q_vals)
 
-    def _get_job_last_op_idx(
-        self, job_id: int, op_id_to_idx: Dict[int, int], job_op_map: Dict[int, List[int]]
-    ) -> Optional[int]:
+    def _get_job_last_op_idx(self, job_id, op_id_to_idx, job_op_map):
         for op_id in reversed(job_op_map.get(job_id, [])):
             if op_id in op_id_to_idx:
                 return op_id_to_idx[op_id]
         return None
 
-    def _build_edge_feat_map(self, graph_data, device) -> Dict[Tuple[int, int], torch.Tensor]:
-        edge_map = {}
+    def _build_edge_feat_map(self, graph_data, device):
+        edge_map   = {}
         edge_index = graph_data['op', 'candidate', 'machine'].edge_index
         edge_attr  = graph_data['op', 'candidate', 'machine'].edge_attr
         for i in range(edge_index.size(1)):
             edge_map[(edge_index[0, i].item(), edge_index[1, i].item())] = edge_attr[i].to(device)
         return edge_map
-
-
-# ──────────────────────────────────────────────────────────
-# Replay Buffer
-# ──────────────────────────────────────────────────────────
-
-class ReplayBuffer:
-    """(obs, action_idx, reward, next_obs, done) transition 저장"""
-
-    def __init__(self, capacity: int = 10000):
-        self.buffer: deque = deque(maxlen=capacity)
-
-    def push(self, obs, action_idx: int, reward: float, next_obs, done: bool):
-        self.buffer.append((obs, action_idx, reward, next_obs, done))
-
-    def sample(self, batch_size: int):
-        return random.sample(self.buffer, batch_size)
-
-    def __len__(self):
-        return len(self.buffer)
 
 
 # ──────────────────────────────────────────────────────────
@@ -255,8 +208,11 @@ class ReplayBuffer:
 class DQNAgent:
     """
     online Q-network + target Q-network.
-    target은 target_update_interval 에피소드마다 online 가중치로 덮어씀.
-    탐색: ε-greedy (매 에피소드 지수 감소).
+
+    업데이트 방식:
+      - window 내 WT 최소 에피소드의 trajectory로 update_from_trajectory() 호출
+      - target_update_cycles 번 업데이트마다 target ← online 가중치 복사
+    탐색: ε-greedy (매 에피소드 지수 감소)
     """
 
     def __init__(
@@ -267,9 +223,6 @@ class DQNAgent:
         epsilon_start: float = 1.0,
         epsilon_min: float = 0.05,
         epsilon_decay: float = 0.995,
-        buffer_size: int = 10000,
-        batch_size: int = 32,
-        target_update_interval: int = 10,
         max_grad_norm: float = 1.0,
         device: str = "cpu",
     ):
@@ -280,30 +233,25 @@ class DQNAgent:
             p.requires_grad = False
 
         self.optimizer     = torch.optim.Adam(self.online_net.parameters(), lr=lr)
-        self.replay_buffer = ReplayBuffer(buffer_size)
         self.gamma         = gamma
         self.epsilon       = epsilon_start
         self.epsilon_min   = epsilon_min
         self.epsilon_decay = epsilon_decay
-        self.batch_size    = batch_size
-        self.target_update_interval = target_update_interval
         self.max_grad_norm = max_grad_norm
         self.device        = device
 
-    # ── obs → forward args ──
-
     def _obs_to_args(self, obs: dict):
-        graph            = obs["graph"]
-        actions          = obs["actions"]
-        precedence_info  = obs["precedence_info"]
-        op_id_to_idx     = {op_id: idx for idx, op_id in
-                            enumerate(sorted(precedence_info["prev_map"].keys()))}
-        job_op_map       = obs.get("job_op_map", {})
+        graph           = obs["graph"]
+        actions         = obs["actions"]
+        precedence_info = obs["precedence_info"]
+        op_id_to_idx    = {op_id: idx for idx, op_id in
+                           enumerate(sorted(precedence_info["prev_map"].keys()))}
+        job_op_map      = obs.get("job_op_map", {})
         return graph, actions, precedence_info, op_id_to_idx, job_op_map
 
-    # ── 액션 선택 (ε-greedy) ──
-
     def select_action(self, obs: dict) -> int:
+        """ε-greedy: ε 확률로 랜덤, 나머지는 Q값 최대 액션"""
+        import random
         actions = obs["actions"]
         if not actions:
             return 0
@@ -313,28 +261,19 @@ class DQNAgent:
             q_vals = self.online_net(*self._obs_to_args(obs))
         return int(q_vals.argmax().item())
 
-    # ── Replay buffer 저장 ──
-
-    def store(self, obs, action_idx: int, reward: float, next_obs, done: bool):
-        self.replay_buffer.push(obs, action_idx, reward, next_obs, done)
-
-    # ── 네트워크 업데이트 ──
-
-    def update(self) -> dict:
-        if len(self.replay_buffer) < self.batch_size:
+    def update_from_trajectory(self, trajectory: list) -> dict:
+        """window 내 최고 에피소드 trajectory로 TD loss → online network 업데이트"""
+        if not trajectory:
             return {}
 
-        batch = self.replay_buffer.sample(self.batch_size)
+        self.optimizer.zero_grad()
         loss_sum = 0.0
 
-        self.optimizer.zero_grad()
-        for obs, action_idx, reward, next_obs, done in batch:
-            # Q_online(s, a)
-            q_vals = self.online_net(*self._obs_to_args(obs))
+        for obs, action_idx, reward, next_obs, done in trajectory:
+            q_vals     = self.online_net(*self._obs_to_args(obs))
             action_idx = min(action_idx, q_vals.size(0) - 1)
-            q_val = q_vals[action_idx]
+            q_val      = q_vals[action_idx]
 
-            # TD target: r + γ * max_a' Q_target(s', a')
             if done or not next_obs["actions"]:
                 target = torch.tensor(float(reward), device=self.device)
             else:
@@ -344,19 +283,16 @@ class DQNAgent:
 
             loss_sum += F.mse_loss(q_val, target)
 
-        loss = loss_sum / self.batch_size
+        loss = loss_sum / len(trajectory)
         loss.backward()
         nn.utils.clip_grad_norm_(self.online_net.parameters(), self.max_grad_norm)
         self.optimizer.step()
 
         return {"loss": loss.item()}
 
-    # ── Target network 업데이트 ──
-
     def update_target(self):
+        """online 가중치를 target에 복사"""
         self.target_net.load_state_dict(self.online_net.state_dict())
-
-    # ── ε 감소 ──
 
     def decay_epsilon(self):
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)

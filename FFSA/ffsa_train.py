@@ -1,16 +1,15 @@
 """
-FFSA 학습 루프 — DQN
-=====================
+FFSA 학습 루프 — Window 기반 Best-Trajectory DQN
+=================================================
 PPT Slide 13: 단계적 실험 전략
   Step 1: 단순 FFSA (assembly 없음)
   Step 2: Assembly 포함
   Step 3: Setup + Buffer
 
-학습 방식: DQN (Deep Q-Network)
-  - Replay Buffer: 매 스텝 (s, a, r, s', done) 저장
-  - Online network: 매 업데이트 주기마다 TD loss로 업데이트
-  - Target network: target_update_interval 에피소드마다 online 가중치 복사
-  - 탐색: ε-greedy (ε 지수 감소)
+학습 방식: Window 기반 Best-Trajectory DQN
+  - window_size 에피소드 수집, 정책 고정 (ε-greedy 탐색)
+  - window 종료 시 WT 최소 에피소드의 trajectory로 TD loss → online Q-network 업데이트
+  - target_update_cycles 번 업데이트마다 target ← online 가중치 복사
 
 모니터링: TensorBoard
   tensorboard --logdir runs/
@@ -43,9 +42,13 @@ class Logger:
         self.writer.add_scalar("episode/deadlock", int(deadlock), ep)
         self.writer.add_scalar("train/epsilon", epsilon, ep)
 
-    def log_update(self, ep: int, metrics: dict):
-        if metrics:
-            self.writer.add_scalar("train/loss", metrics.get("loss", 0), ep)
+    def log_window(self, ep: int, metrics: dict, best_wt: float,
+                   window_wt_list: list, target_updated: bool):
+        self.writer.add_scalar("train/loss",             metrics.get("loss", 0),         ep)
+        self.writer.add_scalar("train/best_wt_in_window", best_wt,                        ep)
+        self.writer.add_scalar("train/mean_wt_in_window", float(np.mean(window_wt_list)), ep)
+        self.writer.add_scalar("train/worst_wt_in_window",float(np.max(window_wt_list)),  ep)
+        self.writer.add_scalar("train/target_updated",   int(target_updated),             ep)
 
     def log_weights(self, ep: int, net: torch.nn.Module):
         for name, param in net.named_parameters():
@@ -64,15 +67,13 @@ class Logger:
 def train(
     config: InstanceConfig,
     num_episodes: int = 500,
+    window_size: int = 5,
+    target_update_cycles: int = 2,
     lr: float = 2e-4,
     gamma: float = 1.0,
     epsilon_start: float = 1.0,
     epsilon_min: float = 0.05,
     epsilon_decay: float = 0.995,
-    buffer_size: int = 10000,
-    batch_size: int = 32,
-    update_interval: int = 4,
-    target_update_interval: int = 10,
     hidden_dim: int = 16,
     device: str = "cpu",
     log_interval: int = 10,
@@ -88,10 +89,9 @@ def train(
     print(f"  Assembly: {config.use_assembly}")
     print(f"  Setup: {config.use_setup}")
     print(f"  유한 버퍼: {config.use_finite_buffer}")
-    print(f"  Episodes: {num_episodes}")
-    print(f"  Buffer: {buffer_size}  |  Batch: {batch_size}")
+    print(f"  Episodes: {num_episodes}  |  Window: {window_size}")
+    print(f"  Target 업데이트: {target_update_cycles} 업데이트 사이클마다")
     print(f"  ε: {epsilon_start} → {epsilon_min} (decay={epsilon_decay})")
-    print(f"  Target update: 매 {target_update_interval} 에피소드")
     print(f"  TensorBoard: runs/{exp_name}")
     print(f"{'='*60}")
 
@@ -114,9 +114,6 @@ def train(
         epsilon_start=epsilon_start,
         epsilon_min=epsilon_min,
         epsilon_decay=epsilon_decay,
-        buffer_size=buffer_size,
-        batch_size=batch_size,
-        target_update_interval=target_update_interval,
         device=device,
     )
 
@@ -124,14 +121,17 @@ def train(
     episode_tardiness = []
     episode_makespans = []
     episode_deadlocks = []
-    metrics: dict = {}
-    step_count = 0
+
+    window_buffer: list = []   # (wt, trajectory) 저장
+    metrics:       dict = {}
+    update_cycle:  int  = 0
 
     for ep in range(1, num_episodes + 1):
         obs, _ = env.reset()
         done         = False
         total_reward = 0.0
         ep_deadlock  = False
+        trajectory   = []
 
         while not done:
             if not obs["actions"]:
@@ -140,19 +140,15 @@ def train(
             action_idx = agent.select_action(obs)
             next_obs, reward, done, truncated, info = env.step(action_idx)
 
-            agent.store(obs, action_idx, reward, next_obs, done or truncated)
+            trajectory.append((obs, action_idx, reward, next_obs, done or truncated))
             total_reward += reward
-            step_count   += 1
-            obs           = next_obs
+            obs = next_obs
 
             if info.get("deadlock"):
                 ep_deadlock = True
-                agent.store(obs, 0, -1000.0, obs, True)
+                trajectory.append((obs, 0, -1000.0, obs, True))
                 total_reward += -1000.0
                 break
-
-            if step_count % update_interval == 0:
-                metrics = agent.update()
 
         wt = env.get_actual_weighted_tardiness()
         ms = env.get_makespan()
@@ -161,14 +157,29 @@ def train(
         episode_tardiness.append(wt)
         episode_makespans.append(ms)
         episode_deadlocks.append(int(ep_deadlock))
+        window_buffer.append((wt, trajectory))
 
         agent.decay_epsilon()
-
-        if ep % target_update_interval == 0:
-            agent.update_target()
-
         logger.log_episode(ep, wt, ms, total_reward, ep_deadlock, agent.epsilon)
-        logger.log_update(ep, metrics)
+
+        # window 종료: WT 최소 trajectory로 online 업데이트
+        policy_updated  = False
+        target_updated  = False
+        if ep % window_size == 0:
+            window_wt_list          = [x[0] for x in window_buffer]
+            best_wt, best_traj      = min(window_buffer, key=lambda x: x[0])
+
+            metrics      = agent.update_from_trajectory(best_traj)
+            window_buffer = []
+            update_cycle += 1
+            policy_updated = True
+
+            # target 업데이트 주기 확인
+            if update_cycle % target_update_cycles == 0:
+                agent.update_target()
+                target_updated = True
+
+            logger.log_window(ep, metrics, best_wt, window_wt_list, target_updated)
 
         if ep % hist_interval == 0:
             logger.log_weights(ep, agent.online_net)
@@ -178,15 +189,16 @@ def train(
             avg_wt = np.mean(episode_tardiness[-log_interval:])
             avg_ms = np.mean(episode_makespans[-log_interval:])
             avg_dl = np.mean(episode_deadlocks[-log_interval:])
-            loss_str = f"loss={metrics.get('loss', 0):.4f}" if metrics else "updating..."
+            loss_str = f"loss={metrics.get('loss', 0):.4f}" if metrics else "no update"
             dl_str   = f" | DL={avg_dl:.1f}" if avg_dl > 0 else ""
-            tgt_str  = " | [TARGET]" if ep % target_update_interval == 0 else ""
+            upd_str  = " | [UPDATE]" if policy_updated else ""
+            tgt_str  = "[TARGET]" if target_updated else ""
             print(
                 f"[Ep {ep:4d}] "
                 f"reward={total_reward:8.2f} (avg={avg_r:8.2f}) | "
                 f"WT={wt:8.2f} (avg={avg_wt:8.2f}) | "
                 f"MS={ms:8.1f} (avg={avg_ms:8.1f}) | "
-                f"ε={agent.epsilon:.3f} | {loss_str}{dl_str}{tgt_str}"
+                f"ε={agent.epsilon:.3f} | {loss_str}{dl_str}{upd_str}{tgt_str}"
             )
 
     print(f"\n{'='*60}")
@@ -244,26 +256,24 @@ def test_random_agent(config: InstanceConfig, num_episodes: int = 5):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FFSA 스케줄링 DQN 학습")
-    parser.add_argument("--step",                   type=int,   default=1, choices=[1, 2, 3])
-    parser.add_argument("--episodes",               type=int,   default=300)
-    parser.add_argument("--lr",                     type=float, default=2e-4)
-    parser.add_argument("--gamma",                  type=float, default=1.0)
-    parser.add_argument("--epsilon-start",          type=float, default=1.0)
-    parser.add_argument("--epsilon-min",            type=float, default=0.05)
-    parser.add_argument("--epsilon-decay",          type=float, default=0.995)
-    parser.add_argument("--buffer-size",            type=int,   default=10000)
-    parser.add_argument("--batch-size",             type=int,   default=32)
-    parser.add_argument("--update-interval",        type=int,   default=4)
-    parser.add_argument("--target-update-interval", type=int,   default=10)
-    parser.add_argument("--hidden-dim",             type=int,   default=16)
-    parser.add_argument("--products",               type=int,   default=4)
-    parser.add_argument("--device",                 type=str,   default="cpu")
-    parser.add_argument("--exp-name",               type=str,   default=None)
-    parser.add_argument("--test-only",              action="store_true")
+    parser.add_argument("--step",                  type=int,   default=1, choices=[1, 2, 3])
+    parser.add_argument("--episodes",              type=int,   default=300)
+    parser.add_argument("--window",                type=int,   default=5)
+    parser.add_argument("--target-update-cycles",  type=int,   default=2)
+    parser.add_argument("--lr",                    type=float, default=2e-4)
+    parser.add_argument("--gamma",                 type=float, default=1.0)
+    parser.add_argument("--epsilon-start",         type=float, default=1.0)
+    parser.add_argument("--epsilon-min",           type=float, default=0.05)
+    parser.add_argument("--epsilon-decay",         type=float, default=0.995)
+    parser.add_argument("--hidden-dim",            type=int,   default=16)
+    parser.add_argument("--products",              type=int,   default=4)
+    parser.add_argument("--device",                type=str,   default="cpu")
+    parser.add_argument("--exp-name",              type=str,   default=None)
+    parser.add_argument("--test-only",             action="store_true")
     args = parser.parse_args()
 
     step_name = {1: "simple", 2: "assembly", 3: "full"}[args.step]
-    exp_name  = args.exp_name or f"dqn_{step_name}_lr{args.lr}"
+    exp_name  = args.exp_name or f"dqn_{step_name}_w{args.window}_lr{args.lr}"
 
     if args.step == 1:
         config = simple_config(num_products=args.products)
@@ -279,15 +289,13 @@ if __name__ == "__main__":
         train(
             config,
             num_episodes=args.episodes,
+            window_size=args.window,
+            target_update_cycles=args.target_update_cycles,
             lr=args.lr,
             gamma=args.gamma,
             epsilon_start=args.epsilon_start,
             epsilon_min=args.epsilon_min,
             epsilon_decay=args.epsilon_decay,
-            buffer_size=args.buffer_size,
-            batch_size=args.batch_size,
-            update_interval=args.update_interval,
-            target_update_interval=args.target_update_interval,
             hidden_dim=args.hidden_dim,
             device=args.device,
             exp_name=exp_name,
