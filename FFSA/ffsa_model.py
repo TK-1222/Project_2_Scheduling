@@ -4,11 +4,11 @@ Dual Q-Network: RegularQNetwork + AssemblyQNetwork
 Regular → Assembly: C_p 컴포넌트 진행 상태 벡터 (hidden_dim + 3)
 Assembly → Regular: U_p 조립 긴급도 신호 벡터 (hidden_dim + 3)
 
-학습: 엇갈린 Window Best-Trajectory DQN
-  - Regular : ep 5, 10, 15 … (window_size마다)
-  - Assembly: ep 6, 11, 16 … (Regular + 1 에피소드 지연)
+학습: Window Best-Trajectory DQN (동시 업데이트)
+  - Regular + Assembly: ep 5, 10, 15 … 동시 업데이트 (Regular 먼저)
   - Target update: 각 네트워크 2 update cycle마다 독립적으로
   - Gradient detach: 상대 네트워크 출력은 항상 detach() 후 입력
+  - Target 계산: 다음 상태의 Regular / Assembly Q값 모두 반영 (글로벌 max)
 """
 
 import copy
@@ -428,15 +428,21 @@ class DualDQNAgent:
         return (obs["graph"], obs["actions"], prec,
                 op_id_to_idx, obs.get("job_op_map", {}))
 
-    def _cross_signals(self, obs: dict, use_target: bool = False):
-        """C_p, U_p 계산. use_target=True 이면 target 네트워크 사용."""
+    def _compute_c_p(self, obs: dict, use_target: bool = False) -> torch.Tensor:
+        """C_p 만 계산 (Regular → Assembly). use_target=True 이면 reg_target 사용."""
         graph, _, prec, op_id_to_idx, _ = self._parse_obs(obs)
         reg_net = self.reg_target if use_target else self.reg_online
-        asm_net = self.asm_target if use_target else self.asm_online
         with torch.no_grad():
             c_p = reg_net.compute_C_p(graph, prec, op_id_to_idx, obs)
+        return c_p.detach()
+
+    def _compute_u_p(self, obs: dict, use_target: bool = False) -> torch.Tensor:
+        """U_p 만 계산 (Assembly → Regular). use_target=True 이면 asm_target 사용."""
+        graph, _, prec, op_id_to_idx, _ = self._parse_obs(obs)
+        asm_net = self.asm_target if use_target else self.asm_online
+        with torch.no_grad():
             u_p = asm_net.compute_U_p(graph, prec, op_id_to_idx, obs)
-        return c_p.detach(), u_p.detach()
+        return u_p.detach()
 
     def select_action(self, obs: dict) -> int:
         """ε-greedy: ε 확률 랜덤, 나머지는 두 네트워크 Q값 통합 argmax."""
@@ -448,7 +454,8 @@ class DualDQNAgent:
             return random.randint(0, len(actions) - 1)
 
         graph, _, prec, op_id_to_idx, job_op_map = self._parse_obs(obs)
-        c_p, u_p = self._cross_signals(obs, use_target=False)
+        c_p = self._compute_c_p(obs, use_target=False)
+        u_p = self._compute_u_p(obs, use_target=False)
 
         reg_idx = [i for i, a in enumerate(actions) if not _is_assembly(a)]
         asm_idx = [i for i, a in enumerate(actions) if     _is_assembly(a)]
@@ -488,7 +495,7 @@ class DualDQNAgent:
 
         for obs, action_idx, reward, next_obs, done in reg_steps:
             graph, actions, prec, op_id_to_idx, _ = self._parse_obs(obs)
-            _, u_p = self._cross_signals(obs, use_target=False)
+            u_p = self._compute_u_p(obs, use_target=False)
 
             q_vals = self.reg_online(graph, actions, prec, op_id_to_idx, u_p=u_p)
 
@@ -501,15 +508,18 @@ class DualDQNAgent:
             if done or not next_obs["actions"]:
                 target = torch.tensor(float(reward), device=self.device)
             else:
-                ng, na, np_, noi, _ = self._parse_obs(next_obs)
-                _, nu_p = self._cross_signals(next_obs, use_target=True)
+                ng, na, np_, noi, njm = self._parse_obs(next_obs)
+                nu_p = self._compute_u_p(next_obs, use_target=True)
+                nc_p = self._compute_c_p(next_obs, use_target=True)
                 next_reg = [a for a in na if not _is_assembly(a)]
-                if next_reg:
-                    with torch.no_grad():
-                        next_q = self.reg_target(ng, na, np_, noi, u_p=nu_p)
-                    target = torch.tensor(float(reward), device=self.device) + self.gamma * next_q.max()
-                else:
-                    target = torch.tensor(float(reward), device=self.device)
+                next_asm = [a for a in na if     _is_assembly(a)]
+                with torch.no_grad():
+                    nq_reg = (self.reg_target(ng, na, np_, noi, u_p=nu_p).max()
+                              if next_reg else torch.tensor(-1e9, device=self.device))
+                    nq_asm = (self.asm_target(ng, na, np_, noi, njm, c_p=nc_p).max()
+                              if next_asm else torch.tensor(-1e9, device=self.device))
+                next_val = torch.max(nq_reg, nq_asm)
+                target = torch.tensor(float(reward), device=self.device) + self.gamma * next_val
 
             loss_sum += F.mse_loss(q_val, target.detach())
 
@@ -540,7 +550,7 @@ class DualDQNAgent:
 
         for obs, action_idx, reward, next_obs, done in asm_steps:
             graph, actions, prec, op_id_to_idx, job_op_map = self._parse_obs(obs)
-            c_p, _ = self._cross_signals(obs, use_target=False)
+            c_p = self._compute_c_p(obs, use_target=False)
 
             q_vals = self.asm_online(graph, actions, prec, op_id_to_idx, job_op_map, c_p=c_p)
 
@@ -554,14 +564,17 @@ class DualDQNAgent:
                 target = torch.tensor(float(reward), device=self.device)
             else:
                 ng, na, np_, noi, njm = self._parse_obs(next_obs)
-                nc_p, _ = self._cross_signals(next_obs, use_target=True)
-                next_asm = [a for a in na if _is_assembly(a)]
-                if next_asm:
-                    with torch.no_grad():
-                        next_q = self.asm_target(ng, na, np_, noi, njm, c_p=nc_p)
-                    target = torch.tensor(float(reward), device=self.device) + self.gamma * next_q.max()
-                else:
-                    target = torch.tensor(float(reward), device=self.device)
+                nc_p = self._compute_c_p(next_obs, use_target=True)
+                nu_p = self._compute_u_p(next_obs, use_target=True)
+                next_reg = [a for a in na if not _is_assembly(a)]
+                next_asm = [a for a in na if     _is_assembly(a)]
+                with torch.no_grad():
+                    nq_reg = (self.reg_target(ng, na, np_, noi, u_p=nu_p).max()
+                              if next_reg else torch.tensor(-1e9, device=self.device))
+                    nq_asm = (self.asm_target(ng, na, np_, noi, njm, c_p=nc_p).max()
+                              if next_asm else torch.tensor(-1e9, device=self.device))
+                next_val = torch.max(nq_reg, nq_asm)
+                target = torch.tensor(float(reward), device=self.device) + self.gamma * next_val
 
             loss_sum += F.mse_loss(q_val, target.detach())
 
