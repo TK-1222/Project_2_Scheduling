@@ -103,8 +103,8 @@ def train(
     print(f"  Setup: {config.use_setup}")
     print(f"  유한 버퍼: {config.use_finite_buffer}")
     print(f"  Episodes: {num_episodes}  |  Window: {window_size}")
-    print(f"  Regular 업데이트: ep {window_size}, {window_size*2}, ...")
-    print(f"  Assembly 업데이트: ep {window_size+1}, {window_size*2+1}, ...")
+    print(f"  업데이트: ep {window_size}, {window_size*2}, ... (Regular → Assembly 순서, 동시)")
+
     print(f"  Target 업데이트: {target_update_cycles} 업데이트 사이클마다")
     print(f"  ε: {epsilon_start} → {epsilon_min} (decay={epsilon_decay})")
     print(f"  TensorBoard: runs/{exp_name}")
@@ -133,12 +133,11 @@ def train(
     episode_makespans = []
     episode_deadlocks = []
 
-    reg_window_buffer: list = []
-    asm_window_buffer: list = []
-    reg_update_cycle: int   = 0
-    asm_update_cycle: int   = 0
-    metrics_reg: dict = {}
-    metrics_asm: dict = {}
+    window_buffer: list    = []
+    reg_update_cycle: int  = 0
+    asm_update_cycle: int  = 0
+    metrics_reg: dict      = {}
+    metrics_asm: dict      = {}
 
     for ep in range(1, num_episodes + 1):
         obs, _ = env.reset()
@@ -172,41 +171,39 @@ def train(
         episode_makespans.append(ms)
         episode_deadlocks.append(int(ep_deadlock))
 
-        reg_window_buffer.append((wt, trajectory))
-        asm_window_buffer.append((wt, trajectory))
+        window_buffer.append((wt, trajectory))
 
         agent.decay_epsilon()
         logger.log_episode(ep, wt, ms, total_reward, ep_deadlock, agent.epsilon)
 
-        # ── Regular 업데이트: ep 5, 10, 15 …
+        # ── 매 window마다 Regular → Assembly 순서로 동시 업데이트
         reg_updated        = False
         reg_target_updated = False
+        asm_updated        = False
+        asm_target_updated = False
         if ep % window_size == 0:
-            reg_wt_list            = [x[0] for x in reg_window_buffer]
-            best_wt_r, best_traj_r = min(reg_window_buffer, key=lambda x: x[0])
-            metrics_reg            = agent.update_regular(best_traj_r)
-            reg_window_buffer      = []
+            wt_list                = [x[0] for x in window_buffer]
+            best_wt, best_traj     = min(window_buffer, key=lambda x: x[0])
+            window_buffer          = []
+
+            # ① Regular 먼저 업데이트
+            metrics_reg            = agent.update_regular(best_traj)
             reg_update_cycle      += 1
             reg_updated            = True
             if reg_update_cycle % target_update_cycles == 0:
                 agent.update_regular_target()
                 reg_target_updated = True
-            logger.log_window_reg(ep, metrics_reg, best_wt_r, reg_wt_list, reg_target_updated)
 
-        # ── Assembly 업데이트: ep 6, 11, 16 …
-        asm_updated        = False
-        asm_target_updated = False
-        if ep % window_size == 1 and ep >= window_size + 1:
-            asm_wt_list            = [x[0] for x in asm_window_buffer]
-            best_wt_a, best_traj_a = min(asm_window_buffer, key=lambda x: x[0])
-            metrics_asm            = agent.update_assembly(best_traj_a)
-            asm_window_buffer      = []
+            # ② Regular 업데이트 직후 최신 C_p로 Assembly 업데이트
+            metrics_asm            = agent.update_assembly(best_traj)
             asm_update_cycle      += 1
             asm_updated            = True
             if asm_update_cycle % target_update_cycles == 0:
                 agent.update_assembly_target()
                 asm_target_updated = True
-            logger.log_window_asm(ep, metrics_asm, best_wt_a, asm_wt_list, asm_target_updated)
+
+            logger.log_window_reg(ep, metrics_reg, best_wt, wt_list, reg_target_updated)
+            logger.log_window_asm(ep, metrics_asm, best_wt, wt_list, asm_target_updated)
 
         if ep % hist_interval == 0:
             logger.log_weights(ep, agent.reg_online, agent.asm_online)
@@ -219,9 +216,7 @@ def train(
             reg_loss = f"reg={metrics_reg.get('loss_reg', 0):.4f}" if metrics_reg else "reg=--"
             asm_loss = f"asm={metrics_asm.get('loss_asm', 0):.4f}" if metrics_asm else "asm=--"
             dl_str   = f" | DL={avg_dl:.1f}" if avg_dl > 0 else ""
-            upd_str  = ""
-            if reg_updated:            upd_str += " [REG]"
-            if asm_updated:            upd_str += " [ASM]"
+            upd_str  = " | [UPDATE]" if reg_updated else ""
             if reg_target_updated or asm_target_updated: upd_str += " [TGT]"
             print(
                 f"[Ep {ep:4d}] "
