@@ -99,7 +99,7 @@ class BufferState:
 # ──────────────────────────────────────────────────────────
 
 class GraphBuilder:
-    """이종 그래프 생성 (PPT Slide 11: State)"""
+    """이종 그래프 생성"""
 
     def __init__(self, instance: FFSAInstance):
         self.inst = instance

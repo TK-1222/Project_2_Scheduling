@@ -1,9 +1,6 @@
 """
 FFSA 인스턴스 생성기
 =====================
-PPT 02장: 집합/인덱스 (P, I, J, K, Ip, Ji, Kj)
-PPT 03장: 파라미터 (pijk, siijk, dp, wp, Bj, epk)
-
 주문 모델:
   - 정규주문: t=0 도착, 제품 종류·수량·납기 지정
   - 긴급주문: t>0 랜덤 도착, 짧은 납기
@@ -67,7 +64,7 @@ class OrderData:
 
 @dataclass
 class ProductData:
-    """제품 정보 (PPT: p ∈ P)"""
+    """제품 정보"""
     product_id: int
     weight: float              # wp (tardiness 가중치)
     num_components: int = 2    # 조립에 필요한 컴포넌트 수 (제품마다 다름)
@@ -91,7 +88,7 @@ class JobData:
 
 @dataclass
 class MachineData:
-    """기계 정보 (PPT: k ∈ K)"""
+    """기계 정보"""
     machine_id: int
     stage_id: int
     compatible_products: List[int] = field(default_factory=list)
