@@ -1,9 +1,6 @@
 """
 FFSA 스케줄링 강화학습 환경
 ============================
-PPT 04장: 제약식 C1~C10 → action mask + DES 로직
-PPT 05장: MDP 정의, State (이종 그래프), Action, Reward
-
 조립 방식: pool 기반 동적 페어링
   - component job 완료 → 조립 stage 버퍼(pool)에 진입
   - 버퍼에 A타입 ≥1, B타입 ≥1 존재 시 조립 가능
@@ -100,7 +97,7 @@ class BufferState:
 # ──────────────────────────────────────────────────────────
 
 class GraphBuilder:
-    """이종 그래프 생성 (PPT Slide 11: State)"""
+    """이종 그래프 생성"""
 
     def __init__(self, instance: FFSAInstance):
         self.inst = instance
