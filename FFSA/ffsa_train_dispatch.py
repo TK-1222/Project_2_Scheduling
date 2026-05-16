@@ -19,6 +19,7 @@ Dual Q-Network (RegularQNetwork + AssemblyQNetwork) Q-value 기반 선택.
 """
 
 import argparse
+import os
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -139,6 +140,11 @@ def train(
     metrics_reg: dict      = {}
     metrics_asm: dict      = {}
 
+    save_dir      = f"runs/{exp_name}/checkpoints"
+    os.makedirs(save_dir, exist_ok=True)
+    best_ever_wt  = float("inf")
+    warmup_eps    = window_size * 10  # 탐색 초기 구간은 저장 제외
+
     for ep in range(1, num_episodes + 1):
         obs, _ = env.reset()
         done         = False
@@ -204,6 +210,17 @@ def train(
 
             logger.log_window_reg(ep, metrics_reg, best_wt, wt_list, reg_target_updated)
             logger.log_window_asm(ep, metrics_asm, best_wt, wt_list, asm_target_updated)
+
+            # 워밍업 이후 window 내 최저 WT가 역대 최저 갱신 시 저장
+            if ep >= warmup_eps and best_wt < best_ever_wt:
+                best_ever_wt = best_wt
+                torch.save({
+                    "ep": ep,
+                    "best_wt": best_ever_wt,
+                    "reg_online": agent.reg_online.state_dict(),
+                    "asm_online": agent.asm_online.state_dict(),
+                }, f"{save_dir}/best_model.pt")
+                print(f"  → [SAVED] ep={ep}  best_wt={best_ever_wt:.2f}")
 
         if ep % hist_interval == 0:
             logger.log_weights(ep, agent.reg_online, agent.asm_online)
