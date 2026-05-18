@@ -10,8 +10,8 @@ Dual Q-Network (RegularQNetwork + AssemblyQNetwork) Q-value 기반 선택.
   - Target  : 각 네트워크 독립적으로 target_update_cycles 마다 업데이트
 
 인스턴스 전략:
-  - 학습: 매 에피소드 랜덤 인스턴스 (seed=None) → 범용 정책 학습
-  - 평가: 고정 시드 인스턴스 여러 개 → 노이즈 없는 순수 성능 측정
+  - 학습: 실행 시작 시 시드를 랜덤 추출 → 전체 에피소드 동일 인스턴스 사용
+  - 평가: 고정 시드 인스턴스 (--eval-seeds) → 일반화 성능 확인용 (선택)
 
 모니터링: TensorBoard
   tensorboard --logdir runs/
@@ -19,6 +19,7 @@ Dual Q-Network (RegularQNetwork + AssemblyQNetwork) Q-value 기반 선택.
 
 import argparse
 import os
+import random
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -136,8 +137,8 @@ def train(
     print(f"  Assembly: {config.use_assembly}")
     print(f"  Setup: {config.use_setup}")
     print(f"  유한 버퍼: {config.use_finite_buffer}")
-    print(f"  학습 인스턴스: 매 에피소드 랜덤 (seed=None)")
-    print(f"  평가 인스턴스: {len(eval_envs)}개 고정" if eval_envs else "  평가: 없음")
+    print(f"  학습 인스턴스: 고정 (seed={config.seed}, 실행마다 랜덤 추출)")
+    print(f"  평가 인스턴스: {len(eval_envs)}개 고정 (일반화 확인용)" if eval_envs else "  평가: 없음")
     print(f"  Episodes: {num_episodes}  |  Window: {window_size}")
     print(f"  업데이트: ep {window_size}, {window_size*2}, ... (Regular → Assembly 순서, 동시)")
     print(f"  Target 업데이트: {target_update_cycles} 업데이트 사이클마다")
@@ -251,10 +252,9 @@ def train(
             logger.log_window_reg(ep, metrics_reg, best_wt, wt_list, reg_target_updated)
             logger.log_window_asm(ep, metrics_asm, best_wt, wt_list, asm_target_updated)
 
-            # 워밍업 이후 eval_wt 기준으로 최저 갱신 시 저장
-            save_wt = eval_wt if (eval_envs and ep % eval_interval == 0) else best_wt
-            if ep >= warmup_eps and save_wt < best_ever_wt:
-                best_ever_wt = save_wt
+            # 워밍업 이후 window 내 최저 WT 갱신 시 저장
+            if ep >= warmup_eps and best_wt < best_ever_wt:
+                best_ever_wt = best_wt
                 torch.save({
                     "ep": ep,
                     "best_wt": best_ever_wt,
@@ -369,10 +369,12 @@ if __name__ == "__main__":
     step_name = {1: "simple", 2: "assembly", 3: "full"}[args.step]
     exp_name  = args.exp_name or f"dual_dqn_dispatch_{step_name}_w{args.window}_lr{args.lr}"
 
-    # 학습: 매 에피소드 랜덤 인스턴스
-    config = _make_config(args.step, args.products, seed=None)
+    # 학습: 실행마다 랜덤 시드 추출 → 전체 에피소드 동일 인스턴스 사용
+    train_seed = random.randint(0, 99999)
+    print(f"학습 인스턴스 시드: {train_seed}")
+    config = _make_config(args.step, args.products, seed=train_seed)
 
-    # 평가: 고정 시드 인스턴스
+    # 평가: 고정 시드 인스턴스 (일반화 확인용, 선택)
     eval_envs = [
         FFSASchedulingEnv(_make_config(args.step, args.products, seed=s))
         for s in args.eval_seeds
