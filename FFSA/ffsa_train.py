@@ -3,20 +3,21 @@ FFSA 학습 루프 — Dual Q-Network (GNN 방식)
 ==========================================
 RegularQNetwork + AssemblyQNetwork 듀얼 에이전트 학습.
 
-업데이트 스케줄 (엇갈린 Window Best-Trajectory):
-  - Regular : ep 5, 10, 15 … window 내 WT 최소 trajectory로 업데이트
-  - Assembly: ep 6, 11, 16 … Regular 보다 1 에피소드 늦게 업데이트
-  - Target  : 각 네트워크 독립적으로 2 update cycle마다 업데이트
+업데이트 스케줄 (Window Best-Trajectory):
+  - Regular + Assembly: window_size 에피소드마다 동시 업데이트 (Regular 먼저)
+  - Target  : 각 네트워크 독립적으로 target_update_cycles 마다 업데이트
 
-네트워크 간 정보 교환:
-  - C_p (Regular → Assembly): GNN 임베딩 평균 + pool 상태 3 스칼라
-  - U_p (Assembly → Regular): GNN 임베딩 평균 + 긴급도 3 스칼라
+인스턴스 전략:
+  - 학습: 실행 시작 시 시드를 랜덤 추출 → 전체 에피소드 동일 인스턴스 사용
+  - 평가: 고정 시드 인스턴스 (--eval-seeds) → 일반화 성능 확인용 (선택)
 
 모니터링: TensorBoard
   tensorboard --logdir runs/
 """
 
 import argparse
+import os
+import random
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -57,6 +58,9 @@ class Logger:
         self.writer.add_scalar("train/asm_mean_wt",        float(np.mean(wt_list)),    ep)
         self.writer.add_scalar("train/asm_target_updated", int(target_updated),         ep)
 
+    def log_eval(self, ep: int, eval_wt: float):
+        self.writer.add_scalar("eval/weighted_tardiness", eval_wt, ep)
+
     def log_weights(self, ep: int, reg_net: torch.nn.Module, asm_net: torch.nn.Module):
         for name, param in reg_net.named_parameters():
             self.writer.add_histogram(f"weights/reg/{name}", param.data, ep)
@@ -69,6 +73,35 @@ class Logger:
 
     def finish(self):
         self.writer.close()
+
+
+# ──────────────────────────────────────────────────────────
+# 고정 인스턴스 평가
+# ──────────────────────────────────────────────────────────
+
+def run_eval(agent: DualDQNAgent, eval_envs: list) -> float:
+    """
+    고정 인스턴스로 greedy 정책 평가 (epsilon=0, 파라미터 업데이트 없음).
+    여러 eval_env의 WT 평균을 반환.
+    """
+    saved_eps = agent.epsilon
+    agent.epsilon = 0.0
+
+    wt_list = []
+    for env in eval_envs:
+        obs, _ = env.reset()
+        done = False
+        while not done:
+            if not obs["actions"]:
+                break
+            action_idx = agent.select_action(obs)
+            obs, _, done, truncated, _ = env.step(action_idx)
+            if truncated:
+                break
+        wt_list.append(env.get_actual_weighted_tardiness())
+
+    agent.epsilon = saved_eps
+    return float(np.mean(wt_list))
 
 
 # ──────────────────────────────────────────────────────────
@@ -90,6 +123,8 @@ def train(
     log_interval: int = 10,
     hist_interval: int = 100,
     exp_name: str = "ffsa_dual_dqn",
+    eval_envs: list = None,
+    eval_interval: int = 10,
 ):
     print(f"{'='*60}")
     print(f"FFSA Dual DQN 학습 시작  [{exp_name}]")
@@ -100,9 +135,10 @@ def train(
     print(f"  Assembly: {config.use_assembly}")
     print(f"  Setup: {config.use_setup}")
     print(f"  유한 버퍼: {config.use_finite_buffer}")
+    print(f"  학습 인스턴스: 고정 (seed={config.seed}, 실행마다 랜덤 추출)")
+    print(f"  평가 인스턴스: {len(eval_envs)}개 고정 (일반화 확인용)" if eval_envs else "  평가: 없음")
     print(f"  Episodes: {num_episodes}  |  Window: {window_size}")
     print(f"  업데이트: ep {window_size}, {window_size*2}, ... (Regular → Assembly 순서, 동시)")
-
     print(f"  Target 업데이트: {target_update_cycles} 업데이트 사이클마다")
     print(f"  ε: {epsilon_start} → {epsilon_min} (decay={epsilon_decay})")
     print(f"  TensorBoard: runs/{exp_name}")
@@ -136,6 +172,11 @@ def train(
     asm_update_cycle: int  = 0
     metrics_reg: dict      = {}
     metrics_asm: dict      = {}
+
+    save_dir     = f"runs/{exp_name}/checkpoints"
+    os.makedirs(save_dir, exist_ok=True)
+    best_ever_wt = float("inf")
+    warmup_eps   = window_size * 10
 
     for ep in range(1, num_episodes + 1):
         obs, _ = env.reset()
@@ -174,6 +215,12 @@ def train(
         agent.decay_epsilon()
         logger.log_episode(ep, wt, ms, total_reward, ep_deadlock, agent.epsilon)
 
+        # ── 고정 인스턴스 평가
+        if eval_envs and ep % eval_interval == 0:
+            eval_wt = run_eval(agent, eval_envs)
+            logger.log_eval(ep, eval_wt)
+            print(f"  → [EVAL] ep={ep}  eval_wt={eval_wt:.2f}")
+
         # ── 매 window마다 Regular → Assembly 순서로 동시 업데이트
         reg_updated        = False
         reg_target_updated = False
@@ -202,6 +249,17 @@ def train(
 
             logger.log_window_reg(ep, metrics_reg, best_wt, wt_list, reg_target_updated)
             logger.log_window_asm(ep, metrics_asm, best_wt, wt_list, asm_target_updated)
+
+            # 워밍업 이후 window 내 최저 WT 갱신 시 저장
+            if ep >= warmup_eps and best_wt < best_ever_wt:
+                best_ever_wt = best_wt
+                torch.save({
+                    "ep": ep,
+                    "best_wt": best_ever_wt,
+                    "reg_online": agent.reg_online.state_dict(),
+                    "asm_online": agent.asm_online.state_dict(),
+                }, f"{save_dir}/best_model.pt")
+                print(f"  → [SAVED] ep={ep}  best_wt={best_ever_wt:.2f}")
 
         if ep % hist_interval == 0:
             logger.log_weights(ep, agent.reg_online, agent.asm_online)
@@ -277,6 +335,15 @@ def test_random_agent(config: InstanceConfig, num_episodes: int = 5):
 # Entry Point
 # ──────────────────────────────────────────────────────────
 
+def _make_config(step: int, num_products: int, seed) -> InstanceConfig:
+    if step == 1:
+        return simple_config(num_products=num_products, seed=seed)
+    elif step == 2:
+        return assembly_config(num_products=num_products, seed=seed)
+    else:
+        return full_config(num_products=num_products, seed=seed)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FFSA Dual DQN 학습")
     parser.add_argument("--step",                  type=int,   default=1, choices=[1, 2, 3])
@@ -293,17 +360,23 @@ if __name__ == "__main__":
     parser.add_argument("--device",                type=str,   default="cpu")
     parser.add_argument("--exp-name",              type=str,   default=None)
     parser.add_argument("--test-only",             action="store_true")
+    parser.add_argument("--eval-seeds",            type=int,   nargs="+", default=[42, 123, 777])
+    parser.add_argument("--eval-interval",         type=int,   default=10)
     args = parser.parse_args()
 
     step_name = {1: "simple", 2: "assembly", 3: "full"}[args.step]
     exp_name  = args.exp_name or f"dual_dqn_{step_name}_w{args.window}_lr{args.lr}"
 
-    if args.step == 1:
-        config = simple_config(num_products=args.products)
-    elif args.step == 2:
-        config = assembly_config(num_products=args.products)
-    else:
-        config = full_config(num_products=args.products)
+    # 학습: 실행마다 랜덤 시드 추출 → 전체 에피소드 동일 인스턴스 사용
+    train_seed = random.randint(0, 99999)
+    print(f"학습 인스턴스 시드: {train_seed}")
+    config = _make_config(args.step, args.products, seed=train_seed)
+
+    # 평가: 고정 시드 인스턴스 (일반화 확인용, 선택)
+    eval_envs = [
+        FFSASchedulingEnv(_make_config(args.step, args.products, seed=s))
+        for s in args.eval_seeds
+    ]
 
     if args.test_only:
         test_random_agent(config)
@@ -322,4 +395,6 @@ if __name__ == "__main__":
             hidden_dim=args.hidden_dim,
             device=args.device,
             exp_name=exp_name,
+            eval_envs=eval_envs,
+            eval_interval=args.eval_interval,
         )
