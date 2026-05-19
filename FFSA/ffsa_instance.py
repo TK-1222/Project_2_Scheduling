@@ -31,7 +31,8 @@ class InstanceConfig:
     buffer_capacity: int = 10
     weight_range: Tuple[float, float] = (1.0, 5.0)
     machine_stage_prob: float = 0.7    # 기계가 스테이지 처리 가능한 확률
-    product_stage_prob: float = 0.7    # 제품이 스테이지를 방문할 확률
+    component_stage_prob: float = 0.7  # 컴포넌트별 스테이지 방문 확률
+    final_stage_prob: float = 0.7      # final job 스테이지 방문 확률
     use_assembly: bool = True
     use_setup: bool = True
     use_finite_buffer: bool = True
@@ -70,7 +71,6 @@ class ProductData:
     product_id: int
     weight: float              # wp (tardiness 가중치)
     num_components: int = 2    # 조립에 필요한 컴포넌트 수 (제품마다 다름)
-    route: List[int] = field(default_factory=list)  # 방문할 스테이지 목록, 순서대로
 
 
 @dataclass
@@ -94,7 +94,8 @@ class MachineData:
     """기계 정보"""
     machine_id: int
     stage_id: int
-    compatible_stages: List[int] = field(default_factory=list)
+    compatible_component_ops: List[Tuple[int, int]] = field(default_factory=list)  # (product_id, component_type_idx)
+    compatible_final_ops: List[int] = field(default_factory=list)                  # product_id
 
 
 @dataclass
@@ -110,11 +111,12 @@ class FFSAInstance:
     num_jobs: int
     num_machines: int
     machines_by_stage: Dict[int, List[int]]
-    processing_times: Dict[Tuple[int, int, int], float]
+    processing_times: Dict[Tuple[int, int, int, int], float]       # (product_id, comp_type, stage_id, machine_id)
+    processing_times_final: Dict[Tuple[int, int, int], float]      # (product_id, stage_id, machine_id)
     setup_times: Dict[Tuple[int, int, int, int], float]
     buffer_capacities: Dict[int, int]
-    machine_stage_matrix: Dict[int, List[int]]   # machine_id → 처리 가능한 stage_id 리스트
-    product_stage_matrix: Dict[int, List[int]]   # product_id → 방문할 stage_id 리스트
+    component_stage_matrix: Dict[Tuple[int, int], List[int]]       # (product_id, comp_type) → [stage_id,...]
+    final_stage_matrix: Dict[int, List[int]]                       # product_id → [stage_id,...]
 
 
 # ──────────────────────────────────────────────────────────
@@ -169,22 +171,79 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
 
     # 긴급주문은 에피소드 진행 중 환경에서 실시간 생성 (포아송 프로세스)
 
+    # ── 기계 호환성 생성 ──
+    # 컴포넌트 job 호환성: (product_id, component_type_idx) 조합
+    # final job 호환성: product_id
+    # 스테이지에 속한 기계만 해당 스테이지 job 처리 가능 (물리적 위치 고정)
+    for m in machines.values():
+        sid = m.stage_id
+        is_asm = (sid == config.assembly_stage_idx)
+
+        if not is_asm:
+            # 비조립 스테이지: 컴포넌트 job 호환성
+            for p_id, prod in products.items():
+                for comp_type in range(prod.num_components):
+                    if rng.random() < config.machine_stage_prob:
+                        m.compatible_component_ops.append((p_id, comp_type))
+            if not m.compatible_component_ops:
+                # 최소 1개 보장
+                p_id = int(rng.randint(config.num_products))
+                comp_type = int(rng.randint(products[p_id].num_components))
+                m.compatible_component_ops.append((p_id, comp_type))
+        else:
+            # 조립 스테이지: final job 호환성 (product_id 단위)
+            for p_id in range(config.num_products):
+                if rng.random() < config.machine_stage_prob:
+                    m.compatible_final_ops.append(p_id)
+            if not m.compatible_final_ops:
+                m.compatible_final_ops.append(int(rng.randint(config.num_products)))
+
+        # post-assembly 스테이지: final job 호환성
+        if sid > config.assembly_stage_idx:
+            for p_id in range(config.num_products):
+                if rng.random() < config.machine_stage_prob:
+                    if p_id not in m.compatible_final_ops:
+                        m.compatible_final_ops.append(p_id)
+            if not m.compatible_final_ops:
+                m.compatible_final_ops.append(int(rng.randint(config.num_products)))
+
+    # ── component_stage_matrix 및 final_stage_matrix 생성 ──
+    pre_asm_stages = stages[:config.assembly_stage_idx]
+    post_asm_stages = stages[config.assembly_stage_idx + 1:]
+    asm_stage = config.assembly_stage_idx
+
+    component_stage_matrix: Dict[Tuple[int, int], List[int]] = {}
+    final_stage_matrix: Dict[int, List[int]] = {}
+
+    for p_id, prod in products.items():
+        for comp_type in range(prod.num_components):
+            visited = [s for s in pre_asm_stages if rng.random() < config.component_stage_prob]
+            if not visited:
+                visited = [int(rng.choice(pre_asm_stages))]
+            component_stage_matrix[(p_id, comp_type)] = sorted(visited)
+
+        # final job: 조립 스테이지 + post-assembly 중 일부
+        visited_post = [s for s in post_asm_stages if rng.random() < config.final_stage_prob]
+        if not visited_post and post_asm_stages:
+            visited_post = [int(rng.choice(post_asm_stages))]
+        final_stage_matrix[p_id] = sorted([asm_stage] + visited_post)
+
     # ── Job 생성 (주문 → unit → component/final) ──
     jobs: Dict[int, JobData] = {}
     jid = 0
 
     if config.use_assembly:
         for order in orders.values():
-            prod_route = products[order.product_id].route
             for unit_idx in range(order.quantity):
                 num_comp = products[order.product_id].num_components
                 for comp_type in range(num_comp):
+                    route = component_stage_matrix[(order.product_id, comp_type)]
                     jobs[jid] = JobData(
                         job_id=jid,
                         product_id=order.product_id,
                         order_id=order.order_id,
                         arrival_time=order.arrival_time,
-                        route=[s for s in prod_route if s < config.assembly_stage_idx],
+                        route=list(route),
                         is_component=True,
                         component_type_idx=comp_type,
                         order_unit_idx=unit_idx,
@@ -193,12 +252,13 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
                     order.component_job_ids.append(jid)
                     jid += 1
 
+                route = final_stage_matrix[order.product_id]
                 jobs[jid] = JobData(
                     job_id=jid,
                     product_id=order.product_id,
                     order_id=order.order_id,
                     arrival_time=order.arrival_time,
-                    route=[s for s in prod_route if s >= config.assembly_stage_idx],
+                    route=list(route),
                     is_final_job=True,
                     assembly_stage=config.assembly_stage_idx,
                     order_unit_idx=unit_idx,
@@ -208,69 +268,50 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
                 jid += 1
     else:
         for order in orders.values():
-            prod_route = products[order.product_id].route
             for unit_idx in range(order.quantity):
+                # no-assembly: use comp_type=0 route as fallback
+                route = component_stage_matrix.get((order.product_id, 0), list(pre_asm_stages))
                 jobs[jid] = JobData(
                     job_id=jid,
                     product_id=order.product_id,
                     order_id=order.order_id,
                     arrival_time=order.arrival_time,
-                    route=list(prod_route),
-                    is_final_job=False,   # assembly 없을 때는 final job 개념 없음
+                    route=list(route),
+                    is_final_job=False,
                     order_unit_idx=unit_idx,
                     due_date=order.due_date,
                 )
-                order.final_job_ids.append(jid)  # 완료 추적용 리스트는 유지
+                order.final_job_ids.append(jid)
                 jid += 1
 
     num_jobs = jid
 
-    # ── 기계-스테이지 호환성 행렬 ──
-    for m in machines.values():
-        for sid in stages:
-            if rng.random() < config.machine_stage_prob:
-                m.compatible_stages.append(sid)
-        if not m.compatible_stages:
-            m.compatible_stages.append(int(rng.choice(stages)))
-
-    # 각 스테이지에 처리 가능한 기계가 최소 1개 보장
-    for sid in stages:
-        compat = [m for m in machines.values() if sid in m.compatible_stages]
-        if not compat:
-            forced = machines[int(rng.choice(list(machines.keys())))]
-            forced.compatible_stages.append(sid)
-
-    machine_stage_matrix = {m.machine_id: m.compatible_stages for m in machines.values()}
-
-    # ── 제품-스테이지 방문 행렬 ──
-    pre_asm = stages[:config.assembly_stage_idx]
-    post_asm_non_asm = stages[config.assembly_stage_idx + 1:]
-    asm_stage = config.assembly_stage_idx
-
-    for p, prod in products.items():
-        # 비조립 pre 스테이지: 확률 기반
-        visited_pre = [s for s in pre_asm if rng.random() < config.product_stage_prob]
-        if not visited_pre:
-            visited_pre = [int(rng.choice(pre_asm))]
-        # 조립 스테이지: use_assembly면 항상 포함
-        visited_asm = [asm_stage] if config.use_assembly else []
-        # 비조립 post 스테이지: 확률 기반
-        visited_post = [s for s in post_asm_non_asm if rng.random() < config.product_stage_prob]
-        if not visited_post:
-            visited_post = [int(rng.choice(post_asm_non_asm))] if post_asm_non_asm else []
-        prod.route = sorted(visited_pre + visited_asm + visited_post)
-
-    product_stage_matrix = {p: prod.route for p, prod in products.items()}
-
     # ── 처리시간 ──
-    processing_times: Dict[Tuple[int, int, int], float] = {}
-    for j in jobs.values():
-        for sid in j.route:
+    # component job 처리시간: (product_id, comp_type_idx, stage_id, machine_id)
+    processing_times: Dict[Tuple[int, int, int, int], float] = {}
+    for (p_id, comp_type), stage_list in component_stage_matrix.items():
+        for sid in stage_list:
             for m in machines_by_stage[sid]:
-                if sid in machines[m].compatible_stages:
-                    processing_times[(j.job_id, sid, m)] = float(
+                if (p_id, comp_type) in machines[m].compatible_component_ops:
+                    processing_times[(p_id, comp_type, sid, m)] = float(
                         rng.uniform(*config.processing_time_range)
                     )
+
+    # final job 처리시간: (product_id, stage_id, machine_id)
+    processing_times_final: Dict[Tuple[int, int, int], float] = {}
+    for p_id, stage_list in final_stage_matrix.items():
+        for sid in stage_list:
+            for m in machines_by_stage[sid]:
+                if sid == config.assembly_stage_idx:
+                    if p_id in machines[m].compatible_final_ops:
+                        processing_times_final[(p_id, sid, m)] = float(
+                            rng.uniform(*config.processing_time_range)
+                        )
+                else:
+                    if p_id in machines[m].compatible_final_ops:
+                        processing_times_final[(p_id, sid, m)] = float(
+                            rng.uniform(*config.processing_time_range)
+                        )
 
     # ── Setup time ──
     setup_times: Dict[Tuple[int, int, int, int], float] = {}
@@ -306,10 +347,11 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
         num_machines=num_machines,
         machines_by_stage=machines_by_stage,
         processing_times=processing_times,
+        processing_times_final=processing_times_final,
         setup_times=setup_times,
         buffer_capacities=buffer_capacities,
-        machine_stage_matrix=machine_stage_matrix,
-        product_stage_matrix=product_stage_matrix,
+        component_stage_matrix=component_stage_matrix,
+        final_stage_matrix=final_stage_matrix,
     )
 
 
