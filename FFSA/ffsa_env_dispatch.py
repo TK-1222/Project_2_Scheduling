@@ -60,7 +60,7 @@ class MachineState:
     """Machine 런타임 상태"""
     machine_id: int
     stage_id: int
-    compatible_products: Set[int] = field(default_factory=set)
+    compatible_stages: Set[int] = field(default_factory=set)
     is_idle: bool = True
     is_blocked: bool = False
     current_op: Optional[int] = None
@@ -213,7 +213,7 @@ class GraphBuilder:
                 continue
             for mid in self.inst.machines_by_stage.get(op.stage_id, []):
                 m_data = self.inst.machines[mid]
-                if op.product_id not in m_data.compatible_products:
+                if op.stage_id not in m_data.compatible_stages:
                     continue
                 pt = self.inst.processing_times.get((op.job_id, op.stage_id, mid), 0.0)
                 pt_norm = pt / self.max_proc if self.max_proc > 0 else 0.0
@@ -346,7 +346,7 @@ class FFSASchedulingEnv(gym.Env):
             self.machine_states[m.machine_id] = MachineState(
                 machine_id=m.machine_id,
                 stage_id=m.stage_id,
-                compatible_products=set(m.compatible_products),
+                compatible_stages=set(m.compatible_stages),
             )
 
     def _init_buffers(self):
@@ -399,9 +399,9 @@ class FFSASchedulingEnv(gym.Env):
         )
         self.instance.orders[new_oid] = order
 
-        stages = list(range(cfg.num_stages))
-        pre_asm = stages[:cfg.assembly_stage_idx]
-        post_asm = stages[cfg.assembly_stage_idx:]
+        prod_route = self.instance.products[p].route
+        pre_asm_route = [s for s in prod_route if s < cfg.assembly_stage_idx]
+        post_asm_route = [s for s in prod_route if s >= cfg.assembly_stage_idx]
 
         new_jid = max(self.instance.jobs.keys(), default=-1) + 1
         new_op_id = max(self.operations.keys(), default=-1) + 1
@@ -413,7 +413,7 @@ class FFSASchedulingEnv(gym.Env):
                 for comp_type in range(num_comp):
                     job = JobData(
                         job_id=new_jid, product_id=p, order_id=new_oid,
-                        arrival_time=t, route=list(pre_asm),
+                        arrival_time=t, route=list(pre_asm_route),
                         is_component=True, component_type_idx=comp_type,
                         order_unit_idx=unit_idx, due_date=due,
                     )
@@ -421,15 +421,15 @@ class FFSASchedulingEnv(gym.Env):
                     order.component_job_ids.append(new_jid)
                     self.job_ops[new_jid] = []
                     # 처리시간 생성
-                    for sid in pre_asm:
+                    for sid in pre_asm_route:
                         for mid in self.instance.machines_by_stage[sid]:
-                            if p in self.instance.machines[mid].compatible_products:
+                            if sid in self.instance.machines[mid].compatible_stages:
                                 self.instance.processing_times[(new_jid, sid, mid)] = float(
                                     rng.uniform(*cfg.processing_time_range)
                                 )
                     # operations 생성 및 버퍼 투입
                     prev_op = None
-                    for sid in pre_asm:
+                    for sid in pre_asm_route:
                         op = OperationState(
                             op_id=new_op_id, job_id=new_jid, product_id=p,
                             stage_id=sid, predecessors=[prev_op] if prev_op is not None else [],
@@ -442,29 +442,30 @@ class FFSASchedulingEnv(gym.Env):
                         prev_op = new_op_id
                         new_op_id += 1
                     # 첫 번째 op 버퍼에 투입
-                    first_op = self.job_ops[new_jid][0]
-                    self.buffers[pre_asm[0]].push(new_jid)
-                    self.operations[first_op].buffer_waiting = True
+                    if self.job_ops[new_jid]:
+                        first_op = self.job_ops[new_jid][0]
+                        self.buffers[pre_asm_route[0]].push(new_jid)
+                        self.operations[first_op].buffer_waiting = True
                     new_jid += 1
 
                 # final job
                 fjob = JobData(
                     job_id=new_jid, product_id=p, order_id=new_oid,
-                    arrival_time=t, route=list(post_asm),
+                    arrival_time=t, route=list(post_asm_route),
                     is_final_job=True, assembly_stage=cfg.assembly_stage_idx,
                     order_unit_idx=unit_idx, due_date=due,
                 )
                 self.instance.jobs[new_jid] = fjob
                 order.final_job_ids.append(new_jid)
                 self.job_ops[new_jid] = []
-                for sid in post_asm:
+                for sid in post_asm_route:
                     for mid in self.instance.machines_by_stage[sid]:
-                        if p in self.instance.machines[mid].compatible_products:
+                        if sid in self.instance.machines[mid].compatible_stages:
                             self.instance.processing_times[(new_jid, sid, mid)] = float(
                                 rng.uniform(*cfg.processing_time_range)
                             )
                 prev_op = None
-                for sid in post_asm:
+                for sid in post_asm_route:
                     is_asm = (sid == cfg.assembly_stage_idx)
                     op = OperationState(
                         op_id=new_op_id, job_id=new_jid, product_id=p,
@@ -483,20 +484,20 @@ class FFSASchedulingEnv(gym.Env):
             else:
                 job = JobData(
                     job_id=new_jid, product_id=p, order_id=new_oid,
-                    arrival_time=t, route=list(stages),
+                    arrival_time=t, route=list(prod_route),
                     is_final_job=False, order_unit_idx=unit_idx, due_date=due,
                 )
                 self.instance.jobs[new_jid] = job
                 order.final_job_ids.append(new_jid)
                 self.job_ops[new_jid] = []
-                for sid in stages:
+                for sid in prod_route:
                     for mid in self.instance.machines_by_stage[sid]:
-                        if p in self.instance.machines[mid].compatible_products:
+                        if sid in self.instance.machines[mid].compatible_stages:
                             self.instance.processing_times[(new_jid, sid, mid)] = float(
                                 rng.uniform(*cfg.processing_time_range)
                             )
                 prev_op = None
-                for sid in stages:
+                for sid in prod_route:
                     op = OperationState(
                         op_id=new_op_id, job_id=new_jid, product_id=p,
                         stage_id=sid, predecessors=[prev_op] if prev_op is not None else [],
@@ -509,7 +510,7 @@ class FFSASchedulingEnv(gym.Env):
                     prev_op = new_op_id
                     new_op_id += 1
                 first_op = self.job_ops[new_jid][0]
-                self.buffers[stages[0]].push(new_jid)
+                self.buffers[prod_route[0]].push(new_jid)
                 self.operations[first_op].buffer_waiting = True
                 new_jid += 1
 
@@ -779,7 +780,7 @@ class FFSASchedulingEnv(gym.Env):
         if op.is_processing:                      return False
         if not ms.is_idle or ms.is_blocked:       return False
         if ms.stage_id != op.stage_id:            return False
-        if op.product_id not in ms.compatible_products:
+        if op.stage_id not in ms.compatible_stages:
             return False
         return True
 
@@ -806,7 +807,7 @@ class FFSASchedulingEnv(gym.Env):
             # 호환 조립 기계
             asm_machines = [
                 mid for mid in self.instance.machines_by_stage.get(asm_stage, [])
-                if (prod_id in self.machine_states[mid].compatible_products
+                if (self.instance.config.assembly_stage_idx in self.machine_states[mid].compatible_stages
                     and self.machine_states[mid].is_idle
                     and not self.machine_states[mid].is_blocked)
             ]
@@ -836,7 +837,7 @@ class FFSASchedulingEnv(gym.Env):
             times = [
                 self.instance.processing_times.get((op.job_id, o.stage_id, mid), 0.0)
                 for mid in self.instance.machines_by_stage.get(o.stage_id, [])
-                if o.product_id in self.instance.machines[mid].compatible_products
+                if o.stage_id in self.instance.machines[mid].compatible_stages
             ]
             total += min(times) if times else 0.0
         return total
@@ -930,11 +931,11 @@ class FFSASchedulingEnv(gym.Env):
             next_stage = self.operations[job_ops[idx + 1]].stage_id
             total = 0.0
             for jid in self.buffers[next_stage].queue:
-                prod = self.instance.jobs[jid].product_id
+                o = self.operations.get(self.job_stage_to_op.get((jid, next_stage), -1))
                 times = [
                     self.instance.processing_times.get((jid, next_stage, mid), 0.0)
                     for mid in self.instance.machines_by_stage.get(next_stage, [])
-                    if prod in self.instance.machines[mid].compatible_products
+                    if next_stage in self.instance.machines[mid].compatible_stages
                 ]
                 total += min(times) if times else 0.0
             return total
@@ -1005,7 +1006,7 @@ class FFSASchedulingEnv(gym.Env):
             next_map[oid] = job_ops[idx + 1] if idx < len(job_ops) - 1 else None
             candidate_machines[oid] = [
                 mid for mid in self.instance.machines_by_stage.get(op.stage_id, [])
-                if op.product_id in self.instance.machines[mid].compatible_products
+                if op.stage_id in self.instance.machines[mid].compatible_stages
             ]
 
         # 조립 pool 정보 (state feature용)
