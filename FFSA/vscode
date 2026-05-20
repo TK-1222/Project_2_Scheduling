@@ -2,3 +2,13 @@ python -m tensorboard.main --logdir C:\VSCode\FFSA\runs
 
 cd C:\VSCode\FFSA
 python ffsa_train_dispatch.py --step 3 --episodes 1000 --hidden-dim 16 --device cuda --train-freq 32 --batch-size 32 --exp-name 1run
+
+num_products: int = 4
+components_range: Tuple[int, int] = (2, 2)   # 변동 없애 고정
+num_stages: int = 6
+assembly_stage_idx: int = 3
+machines_per_stage: [2, 2, 2, 2, 2, 2]       # 총 12대 (현재 22대)
+num_regular_orders: int = 6
+regular_quantity_range: Tuple[int, int] = (1, 3)
+regular_due_date_range: Tuple[float, float] = (300.0, 900.0)  # makespan 줄면 납기도 조정
+num_urgent_orders: int = 1
