@@ -3,9 +3,11 @@ FFSA 학습 루프 — Dual Q-Network (GNN 방식)
 ==========================================
 RegularQNetwork + AssemblyQNetwork 듀얼 에이전트 학습.
 
-업데이트 스케줄 (Window Best-Trajectory):
-  - Regular + Assembly: window_size 에피소드마다 동시 업데이트 (Regular 먼저)
-  - Target  : 각 네트워크 독립적으로 target_update_cycles 마다 업데이트
+업데이트 스케줄 (Experience Replay):
+  - Regular + Assembly: 각 버퍼에서 독립적으로 배치 샘플링 후 업데이트
+  - train_freq 환경 스텝마다 업데이트 시도
+  - learn_start transitions 이상 쌓인 후 학습 시작
+  - Target: 각 네트워크 target_update_freq 업데이트마다 독립적으로 갱신
 
 인스턴스 전략:
   - 학습: 실행 시작 시 시드를 랜덤 추출 → 전체 에피소드 동일 인스턴스 사용
@@ -24,7 +26,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from ffsa_instance import InstanceConfig, simple_config, assembly_config, full_config
 from ffsa_env import FFSASchedulingEnv
-from ffsa_model import RegularQNetwork, AssemblyQNetwork, DualDQNAgent
+from ffsa_model import RegularQNetwork, AssemblyQNetwork, DualDQNAgent, ReplayBuffer, _is_assembly
 from ffsa_viz import log_hetero_graph_to_tensorboard
 
 
@@ -44,19 +46,21 @@ class Logger:
         self.writer.add_scalar("episode/deadlock", int(deadlock), ep)
         self.writer.add_scalar("train/epsilon", epsilon, ep)
 
-    def log_window_reg(self, ep: int, metrics: dict, best_wt: float,
-                       wt_list: list, target_updated: bool):
-        self.writer.add_scalar("train/reg_loss",           metrics.get("loss_reg", 0), ep)
-        self.writer.add_scalar("train/reg_best_wt",        best_wt,                    ep)
-        self.writer.add_scalar("train/reg_mean_wt",        float(np.mean(wt_list)),    ep)
-        self.writer.add_scalar("train/reg_target_updated", int(target_updated),         ep)
+    def log_train_step(self, step: int, reg_loss: float, asm_loss: float):
+        if reg_loss > 0:
+            self.writer.add_scalar("train/reg_loss", reg_loss, step)
+        if asm_loss > 0:
+            self.writer.add_scalar("train/asm_loss", asm_loss, step)
 
-    def log_window_asm(self, ep: int, metrics: dict, best_wt: float,
-                       wt_list: list, target_updated: bool):
-        self.writer.add_scalar("train/asm_loss",           metrics.get("loss_asm", 0), ep)
-        self.writer.add_scalar("train/asm_best_wt",        best_wt,                    ep)
-        self.writer.add_scalar("train/asm_mean_wt",        float(np.mean(wt_list)),    ep)
-        self.writer.add_scalar("train/asm_target_updated", int(target_updated),         ep)
+    def log_train_target(self, step: int, reg_updated: bool, asm_updated: bool):
+        if reg_updated:
+            self.writer.add_scalar("train/reg_target_updated", 1, step)
+        if asm_updated:
+            self.writer.add_scalar("train/asm_target_updated", 1, step)
+
+    def log_buffer(self, ep: int, reg_size: int, asm_size: int):
+        self.writer.add_scalar("train/reg_buffer_size", reg_size, ep)
+        self.writer.add_scalar("train/asm_buffer_size", asm_size, ep)
 
     def log_eval(self, ep: int, eval_wt: float):
         self.writer.add_scalar("eval/weighted_tardiness", eval_wt, ep)
@@ -111,8 +115,11 @@ def run_eval(agent: DualDQNAgent, eval_envs: list) -> float:
 def train(
     config: InstanceConfig,
     num_episodes: int = 500,
-    window_size: int = 5,
-    target_update_cycles: int = 2,
+    buffer_size: int = 50000,
+    batch_size: int = 64,
+    train_freq: int = 4,
+    learn_start: int = 1000,
+    target_update_freq: int = 100,
     lr: float = 2e-4,
     gamma: float = 1.0,
     epsilon_start: float = 1.0,
@@ -136,10 +143,14 @@ def train(
     print(f"  Setup: {config.use_setup}")
     print(f"  유한 버퍼: {config.use_finite_buffer}")
     print(f"  학습 인스턴스: 고정 (seed={config.seed}, 실행마다 랜덤 추출)")
-    print(f"  평가 인스턴스: {len(eval_envs)}개 고정 (일반화 확인용)" if eval_envs else "  평가: 없음")
-    print(f"  Episodes: {num_episodes}  |  Window: {window_size}")
-    print(f"  업데이트: ep {window_size}, {window_size*2}, ... (Regular → Assembly 순서, 동시)")
-    print(f"  Target 업데이트: {target_update_cycles} 업데이트 사이클마다")
+    if eval_envs:
+        print(f"  평가 인스턴스: {len(eval_envs)}개 고정 (일반화 확인용)")
+    else:
+        print(f"  평가: 없음")
+    print(f"  Episodes: {num_episodes}")
+    print(f"  Replay Buffer: reg/asm 별도 | 크기={buffer_size} | 배치={batch_size}")
+    print(f"  학습 주기: {train_freq} 스텝마다 | 워밍업: {learn_start} transitions")
+    print(f"  Target 업데이트: {target_update_freq} 업데이트마다")
     print(f"  ε: {epsilon_start} → {epsilon_min} (decay={epsilon_decay})")
     print(f"  TensorBoard: runs/{exp_name}")
     print(f"{'='*60}")
@@ -162,28 +173,34 @@ def train(
         device=device,
     )
 
+    reg_buffer = ReplayBuffer(buffer_size)
+    asm_buffer = ReplayBuffer(buffer_size)
+
     episode_rewards   = []
     episode_tardiness = []
     episode_makespans = []
     episode_deadlocks = []
 
-    window_buffer: list    = []
-    reg_update_cycle: int  = 0
-    asm_update_cycle: int  = 0
-    metrics_reg: dict      = {}
-    metrics_asm: dict      = {}
+    global_step      = 0
+    reg_update_count = 0
+    asm_update_count = 0
+    metrics_reg: dict = {}
+    metrics_asm: dict = {}
+    last_reg_loss    = 0.0
+    last_asm_loss    = 0.0
 
     save_dir     = f"runs/{exp_name}/checkpoints"
     os.makedirs(save_dir, exist_ok=True)
     best_ever_wt = float("inf")
-    warmup_eps   = window_size * 10
 
     for ep in range(1, num_episodes + 1):
         obs, _ = env.reset()
         done         = False
         total_reward = 0.0
         ep_deadlock  = False
-        trajectory   = []
+
+        reg_target_updated = False
+        asm_target_updated = False
 
         while not done:
             if not obs["actions"]:
@@ -191,16 +208,54 @@ def train(
 
             action_idx = agent.select_action(obs)
             next_obs, reward, done, truncated, info = env.step(action_idx)
+            step_done = done or truncated
 
-            trajectory.append((obs, action_idx, reward, next_obs, done or truncated))
+            # 액션 타입에 따라 버퍼 분리 push
+            if _is_assembly(obs["actions"][action_idx]):
+                asm_buffer.push(obs, action_idx, reward, next_obs, step_done)
+            else:
+                reg_buffer.push(obs, action_idx, reward, next_obs, step_done)
+
             total_reward += reward
+            global_step  += 1
             obs = next_obs
 
             if info.get("deadlock"):
-                ep_deadlock = True
-                trajectory.append((obs, 0, -1000.0, obs, True))
+                ep_deadlock   = True
                 total_reward += -1000.0
+                # done=True이므로 target = -1000 (액션 인덱스는 학습에 영향 없음)
+                dl_act = next(
+                    (i for i, a in enumerate(obs["actions"]) if not _is_assembly(a)),
+                    0
+                )
+                reg_buffer.push(obs, dl_act, -1000.0, obs, True)
                 break
+
+            # train_freq 스텝마다 배치 학습
+            if global_step % train_freq == 0:
+                if len(reg_buffer) >= learn_start:
+                    batch         = reg_buffer.sample(batch_size)
+                    metrics_reg   = agent.update_regular_batch(batch)
+                    last_reg_loss = metrics_reg.get("loss_reg", 0.0)
+                    reg_update_count += 1
+                    if reg_update_count % target_update_freq == 0:
+                        agent.update_regular_target()
+                        reg_target_updated = True
+
+                if len(asm_buffer) >= learn_start:
+                    batch         = asm_buffer.sample(batch_size)
+                    metrics_asm   = agent.update_assembly_batch(batch)
+                    last_asm_loss = metrics_asm.get("loss_asm", 0.0)
+                    asm_update_count += 1
+                    if asm_update_count % target_update_freq == 0:
+                        agent.update_assembly_target()
+                        asm_target_updated = True
+
+                logger.log_train_step(global_step, last_reg_loss, last_asm_loss)
+                if reg_target_updated or asm_target_updated:
+                    logger.log_train_target(global_step, reg_target_updated, asm_target_updated)
+                    reg_target_updated = False
+                    asm_target_updated = False
 
         wt = env.get_actual_weighted_tardiness()
         ms = env.get_makespan()
@@ -210,56 +265,27 @@ def train(
         episode_makespans.append(ms)
         episode_deadlocks.append(int(ep_deadlock))
 
-        window_buffer.append((wt, trajectory))
-
         agent.decay_epsilon()
         logger.log_episode(ep, wt, ms, total_reward, ep_deadlock, agent.epsilon)
+        logger.log_buffer(ep, len(reg_buffer), len(asm_buffer))
 
-        # ── 고정 인스턴스 평가
+        # 고정 인스턴스 평가
         if eval_envs and ep % eval_interval == 0:
             eval_wt = run_eval(agent, eval_envs)
             logger.log_eval(ep, eval_wt)
             print(f"  → [EVAL] ep={ep}  eval_wt={eval_wt:.2f}")
 
-        # ── 매 window마다 Regular → Assembly 순서로 동시 업데이트
-        reg_updated        = False
-        reg_target_updated = False
-        asm_updated        = False
-        asm_target_updated = False
-        if ep % window_size == 0:
-            wt_list                = [x[0] for x in window_buffer]
-            best_wt, best_traj     = min(window_buffer, key=lambda x: x[0])
-            window_buffer          = []
-
-            # ① Regular 먼저 업데이트
-            metrics_reg            = agent.update_regular(best_traj)
-            reg_update_cycle      += 1
-            reg_updated            = True
-            if reg_update_cycle % target_update_cycles == 0:
-                agent.update_regular_target()
-                reg_target_updated = True
-
-            # ② Regular 업데이트 직후 최신 C_p로 Assembly 업데이트
-            metrics_asm            = agent.update_assembly(best_traj)
-            asm_update_cycle      += 1
-            asm_updated            = True
-            if asm_update_cycle % target_update_cycles == 0:
-                agent.update_assembly_target()
-                asm_target_updated = True
-
-            logger.log_window_reg(ep, metrics_reg, best_wt, wt_list, reg_target_updated)
-            logger.log_window_asm(ep, metrics_asm, best_wt, wt_list, asm_target_updated)
-
-            # 워밍업 이후 window 내 최저 WT 갱신 시 저장
-            if ep >= warmup_eps and best_wt < best_ever_wt:
-                best_ever_wt = best_wt
-                torch.save({
-                    "ep": ep,
-                    "best_wt": best_ever_wt,
-                    "reg_online": agent.reg_online.state_dict(),
-                    "asm_online": agent.asm_online.state_dict(),
-                }, f"{save_dir}/best_model.pt")
-                print(f"  → [SAVED] ep={ep}  best_wt={best_ever_wt:.2f}")
+        # 워밍업 완료 후 최저 WT 갱신 시 저장
+        warmup_done = len(reg_buffer) >= learn_start
+        if warmup_done and wt < best_ever_wt:
+            best_ever_wt = wt
+            torch.save({
+                "ep": ep,
+                "best_wt": best_ever_wt,
+                "reg_online": agent.reg_online.state_dict(),
+                "asm_online": agent.asm_online.state_dict(),
+            }, f"{save_dir}/best_model.pt")
+            print(f"  → [SAVED] ep={ep}  best_wt={best_ever_wt:.2f}")
 
         if ep % hist_interval == 0:
             logger.log_weights(ep, agent.reg_online, agent.asm_online)
@@ -269,17 +295,16 @@ def train(
             avg_wt = np.mean(episode_tardiness[-log_interval:])
             avg_ms = np.mean(episode_makespans[-log_interval:])
             avg_dl = np.mean(episode_deadlocks[-log_interval:])
-            reg_loss = f"reg={metrics_reg.get('loss_reg', 0):.4f}" if metrics_reg else "reg=--"
-            asm_loss = f"asm={metrics_asm.get('loss_asm', 0):.4f}" if metrics_asm else "asm=--"
-            dl_str   = f" | DL={avg_dl:.1f}" if avg_dl > 0 else ""
-            upd_str  = " | [UPDATE]" if reg_updated else ""
-            if reg_target_updated or asm_target_updated: upd_str += " [TGT]"
+            reg_loss_str = f"reg={last_reg_loss:.4f}" if metrics_reg else "reg=--"
+            asm_loss_str = f"asm={last_asm_loss:.4f}" if metrics_asm else "asm=--"
+            buf_str = f" | buf=reg:{len(reg_buffer)}/asm:{len(asm_buffer)}"
+            dl_str  = f" | DL={avg_dl:.1f}" if avg_dl > 0 else ""
             print(
                 f"[Ep {ep:4d}] "
                 f"reward={total_reward:8.2f} (avg={avg_r:8.2f}) | "
                 f"WT={wt:8.2f} (avg={avg_wt:8.2f}) | "
                 f"MS={ms:8.1f} (avg={avg_ms:8.1f}) | "
-                f"ε={agent.epsilon:.3f} | {reg_loss} {asm_loss}{dl_str}{upd_str}"
+                f"ε={agent.epsilon:.3f} | {reg_loss_str} {asm_loss_str}{buf_str}{dl_str}"
             )
 
     print(f"\n{'='*60}")
@@ -346,26 +371,29 @@ def _make_config(step: int, num_products: int, seed) -> InstanceConfig:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FFSA Dual DQN 학습")
-    parser.add_argument("--step",                  type=int,   default=1, choices=[1, 2, 3])
-    parser.add_argument("--episodes",              type=int,   default=300)
-    parser.add_argument("--window",                type=int,   default=5)
-    parser.add_argument("--target-update-cycles",  type=int,   default=2)
-    parser.add_argument("--lr",                    type=float, default=2e-4)
-    parser.add_argument("--gamma",                 type=float, default=1.0)
-    parser.add_argument("--epsilon-start",         type=float, default=1.0)
-    parser.add_argument("--epsilon-min",           type=float, default=0.05)
-    parser.add_argument("--epsilon-decay",         type=float, default=0.995)
-    parser.add_argument("--hidden-dim",            type=int,   default=16)
-    parser.add_argument("--products",              type=int,   default=4)
-    parser.add_argument("--device",                type=str,   default="cpu")
-    parser.add_argument("--exp-name",              type=str,   default=None)
-    parser.add_argument("--test-only",             action="store_true")
-    parser.add_argument("--eval-seeds",            type=int,   nargs="+", default=[42, 123, 777])
-    parser.add_argument("--eval-interval",         type=int,   default=10)
+    parser.add_argument("--step",               type=int,   default=1, choices=[1, 2, 3])
+    parser.add_argument("--episodes",           type=int,   default=300)
+    parser.add_argument("--buffer-size",        type=int,   default=50000)
+    parser.add_argument("--batch-size",         type=int,   default=64)
+    parser.add_argument("--train-freq",         type=int,   default=4)
+    parser.add_argument("--learn-start",        type=int,   default=1000)
+    parser.add_argument("--target-update-freq", type=int,   default=100)
+    parser.add_argument("--lr",                 type=float, default=2e-4)
+    parser.add_argument("--gamma",              type=float, default=1.0)
+    parser.add_argument("--epsilon-start",      type=float, default=1.0)
+    parser.add_argument("--epsilon-min",        type=float, default=0.05)
+    parser.add_argument("--epsilon-decay",      type=float, default=0.995)
+    parser.add_argument("--hidden-dim",         type=int,   default=16)
+    parser.add_argument("--products",           type=int,   default=4)
+    parser.add_argument("--device",             type=str,   default="cpu")
+    parser.add_argument("--exp-name",           type=str,   default=None)
+    parser.add_argument("--test-only",          action="store_true")
+    parser.add_argument("--eval-seeds",         type=int,   nargs="+", default=[42, 123, 777])
+    parser.add_argument("--eval-interval",      type=int,   default=10)
     args = parser.parse_args()
 
     step_name = {1: "simple", 2: "assembly", 3: "full"}[args.step]
-    exp_name  = args.exp_name or f"dual_dqn_{step_name}_w{args.window}_lr{args.lr}"
+    exp_name  = args.exp_name or f"dual_dqn_{step_name}_buf{args.buffer_size}_lr{args.lr}"
 
     # 학습: 실행마다 랜덤 시드 추출 → 전체 에피소드 동일 인스턴스 사용
     train_seed = random.randint(0, 99999)
@@ -385,8 +413,11 @@ if __name__ == "__main__":
         train(
             config,
             num_episodes=args.episodes,
-            window_size=args.window,
-            target_update_cycles=args.target_update_cycles,
+            buffer_size=args.buffer_size,
+            batch_size=args.batch_size,
+            train_freq=args.train_freq,
+            learn_start=args.learn_start,
+            target_update_freq=args.target_update_freq,
             lr=args.lr,
             gamma=args.gamma,
             epsilon_start=args.epsilon_start,
