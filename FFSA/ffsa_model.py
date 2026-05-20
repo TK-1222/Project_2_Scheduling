@@ -12,6 +12,8 @@ Assembly → Regular: U_p 조립 긴급도 신호 벡터 (hidden_dim + 3)
 """
 
 import copy
+import random
+from collections import deque
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -27,6 +29,22 @@ Action = Union[RegularAction, AssemblyAction]
 
 def _is_assembly(action: Action) -> bool:
     return isinstance(action[0], tuple)
+
+
+class ReplayBuffer:
+    """Regular / Assembly 각각 별도 인스턴스로 사용하는 경험 리플레이 버퍼."""
+
+    def __init__(self, capacity: int = 50000):
+        self.buffer = deque(maxlen=capacity)
+
+    def push(self, obs, action_idx: int, reward: float, next_obs, done: bool):
+        self.buffer.append((obs, action_idx, reward, next_obs, done))
+
+    def sample(self, batch_size: int) -> list:
+        return random.sample(self.buffer, min(batch_size, len(self.buffer)))
+
+    def __len__(self) -> int:
+        return len(self.buffer)
 
 
 # ──────────────────────────────────────────────────────────
@@ -446,7 +464,6 @@ class DualDQNAgent:
 
     def select_action(self, obs: dict) -> int:
         """ε-greedy: ε 확률 랜덤, 나머지는 두 네트워크 Q값 통합 argmax."""
-        import random
         actions = obs["actions"]
         if not actions:
             return 0
@@ -531,6 +548,110 @@ class DualDQNAgent:
         nn.utils.clip_grad_norm_(self.reg_online.parameters(), self.max_grad_norm)
         self.reg_optimizer.step()
         return {"loss_reg": loss.item()}
+
+    def update_regular_batch(self, batch: list) -> dict:
+        """reg_buffer 샘플 배치로 Regular 네트워크 업데이트. Huber loss 사용."""
+        reg_steps = [
+            (obs, act, r, nobs, done)
+            for obs, act, r, nobs, done in batch
+            if act < len(obs["actions"]) and not _is_assembly(obs["actions"][act])
+        ]
+        if not reg_steps:
+            return {"loss_reg": 0.0}
+
+        self.reg_optimizer.zero_grad()
+        losses = []
+
+        for obs, action_idx, reward, next_obs, done in reg_steps:
+            graph, actions, prec, op_id_to_idx, _ = self._parse_obs(obs)
+            u_p = self._compute_u_p(obs, use_target=False)
+
+            q_vals = self.reg_online(graph, actions, prec, op_id_to_idx, u_p=u_p)
+
+            reg_global = [i for i, a in enumerate(actions) if not _is_assembly(a)]
+            if action_idx not in reg_global:
+                continue
+            local_idx = min(reg_global.index(action_idx), q_vals.size(0) - 1)
+            q_val = q_vals[local_idx]
+
+            if done or not next_obs["actions"]:
+                target = torch.tensor(float(reward), device=self.device)
+            else:
+                ng, na, np_, noi, njm = self._parse_obs(next_obs)
+                nu_p = self._compute_u_p(next_obs, use_target=True)
+                nc_p = self._compute_c_p(next_obs, use_target=True)
+                next_reg = [a for a in na if not _is_assembly(a)]
+                next_asm = [a for a in na if     _is_assembly(a)]
+                with torch.no_grad():
+                    nq_reg = (self.reg_target(ng, na, np_, noi, u_p=nu_p).max()
+                              if next_reg else torch.tensor(-1e9, device=self.device))
+                    nq_asm = (self.asm_target(ng, na, np_, noi, njm, c_p=nc_p).max()
+                              if next_asm else torch.tensor(-1e9, device=self.device))
+                next_val = torch.max(nq_reg, nq_asm)
+                target = torch.tensor(float(reward), device=self.device) + self.gamma * next_val
+
+            losses.append(F.smooth_l1_loss(q_val, target.detach()))
+
+        if not losses:
+            return {"loss_reg": 0.0}
+
+        loss = torch.stack(losses).mean()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.reg_online.parameters(), self.max_grad_norm)
+        self.reg_optimizer.step()
+        return {"loss_reg": loss.item()}
+
+    def update_assembly_batch(self, batch: list) -> dict:
+        """asm_buffer 샘플 배치로 Assembly 네트워크 업데이트. Huber loss 사용."""
+        asm_steps = [
+            (obs, act, r, nobs, done)
+            for obs, act, r, nobs, done in batch
+            if act < len(obs["actions"]) and _is_assembly(obs["actions"][act])
+        ]
+        if not asm_steps:
+            return {"loss_asm": 0.0}
+
+        self.asm_optimizer.zero_grad()
+        losses = []
+
+        for obs, action_idx, reward, next_obs, done in asm_steps:
+            graph, actions, prec, op_id_to_idx, job_op_map = self._parse_obs(obs)
+            c_p = self._compute_c_p(obs, use_target=False)
+
+            q_vals = self.asm_online(graph, actions, prec, op_id_to_idx, job_op_map, c_p=c_p)
+
+            asm_global = [i for i, a in enumerate(actions) if _is_assembly(a)]
+            if action_idx not in asm_global:
+                continue
+            local_idx = min(asm_global.index(action_idx), q_vals.size(0) - 1)
+            q_val = q_vals[local_idx]
+
+            if done or not next_obs["actions"]:
+                target = torch.tensor(float(reward), device=self.device)
+            else:
+                ng, na, np_, noi, njm = self._parse_obs(next_obs)
+                nc_p = self._compute_c_p(next_obs, use_target=True)
+                nu_p = self._compute_u_p(next_obs, use_target=True)
+                next_reg = [a for a in na if not _is_assembly(a)]
+                next_asm = [a for a in na if     _is_assembly(a)]
+                with torch.no_grad():
+                    nq_reg = (self.reg_target(ng, na, np_, noi, u_p=nu_p).max()
+                              if next_reg else torch.tensor(-1e9, device=self.device))
+                    nq_asm = (self.asm_target(ng, na, np_, noi, njm, c_p=nc_p).max()
+                              if next_asm else torch.tensor(-1e9, device=self.device))
+                next_val = torch.max(nq_reg, nq_asm)
+                target = torch.tensor(float(reward), device=self.device) + self.gamma * next_val
+
+            losses.append(F.smooth_l1_loss(q_val, target.detach()))
+
+        if not losses:
+            return {"loss_asm": 0.0}
+
+        loss = torch.stack(losses).mean()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.asm_online.parameters(), self.max_grad_norm)
+        self.asm_optimizer.step()
+        return {"loss_asm": loss.item()}
 
     def update_assembly(self, trajectory: list) -> dict:
         """
