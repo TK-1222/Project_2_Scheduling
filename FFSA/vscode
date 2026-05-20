@@ -1,0 +1,4 @@
+python -m tensorboard.main --logdir C:\VSCode\FFSA\runs
+
+cd C:\VSCode\FFSA
+python ffsa_train_dispatch.py --step 3 --episodes 1000 --hidden-dim 16 --device cuda --train-freq 32 --batch-size 32 --exp-name 1run
