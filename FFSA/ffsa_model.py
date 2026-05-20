@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.data import Batch as PyGBatch
 from torch_geometric.nn import GATConv
 
 RegularAction = Tuple[int, int]
@@ -139,6 +140,93 @@ class GNNEncoder(nn.Module):
 
         return op_h, machine_h
 
+    def forward_batch(self, graphs_and_info, device):
+        """
+        여러 그래프를 한 번에 인코딩 (PyG mega-graph).
+        graphs_and_info: list of (graph_data, precedence_info, op_id_to_idx)
+        Returns: list of (op_h, machine_h) — 순서 보존
+        """
+        n       = len(graphs_and_info)
+        results = [None] * n
+
+        non_empty_indices = []
+        for i, (g, _, _) in enumerate(graphs_and_info):
+            if g['op'].x.size(0) == 0:
+                machine_h  = self.machine_encoder(g['machine'].x.to(device))
+                results[i] = (torch.zeros((0, self.hidden_dim), device=device), machine_h)
+            else:
+                non_empty_indices.append(i)
+
+        if not non_empty_indices:
+            return results
+
+        # ── 1. mega-graph 생성 및 선형 인코딩 ──
+        graph_list = [graphs_and_info[i][0] for i in non_empty_indices]
+        batched    = PyGBatch.from_data_list(graph_list).to(device)
+
+        op_h_b      = self.op_encoder(batched['op'].x)
+        machine_h_b = self.machine_encoder(batched['machine'].x)
+
+        cand_edge = batched['op', 'candidate', 'machine'].edge_index
+        cand_attr = batched['op', 'candidate', 'machine'].edge_attr
+        rev_edge  = batched['machine', 'candidate_rev', 'op'].edge_index
+        rev_attr  = batched['machine', 'candidate_rev', 'op'].edge_attr
+
+        # ── 2. GAT (한 번의 메가-그래프 순전파) ──
+        for i in range(self.num_layers):
+            if cand_edge.size(1) > 0:
+                machine_h_b = F.elu(self.gat_op2m[i]((op_h_b, machine_h_b), cand_edge, edge_attr=cand_attr) + machine_h_b)
+            if rev_edge.size(1) > 0:
+                op_h_b = F.elu(self.gat_m2o[i]((machine_h_b, op_h_b), rev_edge, edge_attr=rev_attr) + op_h_b)
+
+        op_batch_vec      = batched['op'].batch
+        machine_batch_vec = batched['machine'].batch
+
+        # ── 3. 그래프별 분할 + theta 집계 ──
+        for local_i, orig_i in enumerate(non_empty_indices):
+            _, prec, op_id_to_idx = graphs_and_info[orig_i]
+
+            op_h      = op_h_b[op_batch_vec == local_i]
+            machine_h = machine_h_b[machine_batch_vec == local_i]
+
+            num_ops     = op_h.size(0)
+            zero_pad    = torch.zeros((1, self.hidden_dim), device=device)
+            op_h_padded = torch.cat([op_h, zero_pad], dim=0)
+
+            prev_map           = prec['prev_map']
+            next_map           = prec['next_map']
+            candidate_machines = prec['candidate_machines']
+
+            sorted_op_ids = sorted(op_id_to_idx, key=op_id_to_idx.get)
+            prev_idx = torch.tensor(
+                [op_id_to_idx.get(prev_map.get(oid), num_ops)
+                 if prev_map.get(oid) is not None else num_ops
+                 for oid in sorted_op_ids], dtype=torch.long, device=device)
+            next_idx = torch.tensor(
+                [op_id_to_idx.get(next_map.get(oid), num_ops)
+                 if next_map.get(oid) is not None else num_ops
+                 for oid in sorted_op_ids], dtype=torch.long, device=device)
+
+            prev_h = op_h_padded[prev_idx]
+            next_h = op_h_padded[next_idx]
+
+            machine_mean = torch.zeros((num_ops, self.hidden_dim), device=device)
+            for op_id, idx in op_id_to_idx.items():
+                valid_m = [m for m in candidate_machines.get(op_id, []) if m < machine_h.size(0)]
+                if valid_m:
+                    machine_mean[idx] = machine_h[valid_m].mean(dim=0)
+
+            op_h = self.theta0(torch.cat([
+                F.elu(self.theta1(prev_h)),
+                F.elu(self.theta2(next_h)),
+                F.elu(self.theta3(machine_mean)),
+                F.elu(self.theta4(op_h)),
+            ], dim=-1))
+
+            results[orig_i] = (op_h, machine_h)
+
+        return results
+
 
 # ──────────────────────────────────────────────────────────
 # RegularQNetwork
@@ -255,6 +343,86 @@ class RegularQNetwork(nn.Module):
             dtype=torch.float32, device=device,
         )
         return torch.cat([gnn_emb.detach(), scalar])
+
+    def compute_C_p_from_embeddings(self, op_h: torch.Tensor, obs: dict) -> torch.Tensor:
+        """사전 계산된 op_h로 C_p 산출 — 인코더 재호출 없음."""
+        device        = op_h.device
+        assembly_pool = obs.get("assembly_pool", {})
+        inactive      = obs.get("inactive_final_jobs", {})
+
+        pool_total = sum(
+            len(jobs)
+            for type_pool in assembly_pool.values()
+            for jobs in type_pool.values()
+        )
+        pool_count_norm = min(pool_total / max(len(assembly_pool) * 5, 1), 1.0)
+
+        if assembly_pool:
+            ready           = sum(1 for tp in assembly_pool.values() if len(tp) >= 2)
+            pool_ready_rate = ready / len(assembly_pool)
+        else:
+            pool_ready_rate = 0.0
+
+        inactive_counts = [len(v) for v in inactive.values()]
+        inactive_norm   = min(float(np.mean(inactive_counts)) / 5.0, 1.0) if inactive_counts else 0.0
+
+        gnn_emb = op_h.mean(dim=0) if op_h.size(0) > 0 else torch.zeros(self.hidden_dim, device=device)
+        scalar  = torch.tensor([pool_count_norm, pool_ready_rate, inactive_norm],
+                               dtype=torch.float32, device=device)
+        return torch.cat([gnn_emb.detach(), scalar])
+
+    def forward_from_embeddings(
+        self,
+        op_h: torch.Tensor,
+        machine_h: torch.Tensor,
+        actions: list,
+        graph_data,
+        op_id_to_idx: dict,
+        u_p: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """사전 계산된 임베딩으로 Regular Q-값 산출 — MLP 한 번 호출."""
+        device   = op_h.device
+        reg_acts = [a for a in actions if not _is_assembly(a)]
+        if not reg_acts:
+            return torch.zeros(1, device=device)
+
+        graph_emb = torch.cat([op_h.mean(dim=0), machine_h.mean(dim=0)])
+        if u_p is None:
+            u_p = torch.zeros(self.cross_dim, device=device)
+
+        ei = graph_data['op', 'candidate', 'machine'].edge_index.to(device)
+        ea = graph_data['op', 'candidate', 'machine'].edge_attr.to(device)
+        ef_matrix = torch.zeros(
+            max(op_h.size(0), 1), max(machine_h.size(0), 1), self.edge_feat_dim, device=device
+        )
+        if ei.size(1) > 0:
+            ef_matrix[ei[0], ei[1]] = ea
+
+        valid_inps, valid_locals = [], []
+        for local_i, (op_id, mid) in enumerate(reg_acts):
+            op_idx = op_id_to_idx.get(op_id)
+            if op_idx is None or op_idx >= op_h.size(0) or mid >= machine_h.size(0):
+                continue
+            inp = torch.cat([op_h[op_idx], machine_h[mid], graph_emb, ef_matrix[op_idx, mid], u_p])
+            valid_inps.append(inp)
+            valid_locals.append(local_i)
+
+        if not valid_inps:
+            return torch.full((len(reg_acts),), -1e9, device=device)
+
+        q_computed = self.q_mlp(torch.stack(valid_inps)).squeeze(-1)
+
+        if len(valid_locals) == len(reg_acts):
+            return q_computed
+
+        valid_set = set(valid_locals)
+        q_full, ptr = [], 0
+        for local_i in range(len(reg_acts)):
+            if local_i in valid_set:
+                q_full.append(q_computed[ptr]); ptr += 1
+            else:
+                q_full.append(torch.tensor(-1e9, device=device))
+        return torch.stack(q_full)
 
 
 # ──────────────────────────────────────────────────────────
@@ -387,6 +555,94 @@ class AssemblyQNetwork(nn.Module):
         )
         return torch.cat([gnn_emb.detach(), scalar])
 
+    def compute_U_p_from_embeddings(
+        self, op_h: torch.Tensor, graph_data, obs: dict
+    ) -> torch.Tensor:
+        """사전 계산된 op_h로 U_p 산출 — 인코더 재호출 없음."""
+        device        = op_h.device
+        op_x          = graph_data['op'].x.to(device)
+        assembly_pool = obs.get("assembly_pool", {})
+        inactive      = obs.get("inactive_final_jobs", {})
+
+        urgency_score = 0.0
+        if op_x.size(0) > 0:
+            is_asm   = op_x[:, 3]
+            due_norm = op_x[:, 8]
+            wt_norm  = op_x[:, 9]
+            mask     = is_asm > 0.5
+            if mask.any():
+                urgency_score = float(
+                    (wt_norm[mask] / (due_norm[mask] + 0.01)).mean().item()
+                )
+
+        shortage_rate = (
+            sum(1 for tp in assembly_pool.values() if len(tp) < 2) / len(assembly_pool)
+            if assembly_pool else 1.0
+        )
+        pressure = (
+            sum(1 for v in inactive.values() if v) / len(inactive)
+            if inactive else 0.0
+        )
+
+        gnn_emb = op_h.mean(dim=0) if op_h.size(0) > 0 else torch.zeros(self.hidden_dim, device=device)
+        scalar  = torch.tensor([urgency_score, shortage_rate, pressure],
+                               dtype=torch.float32, device=device)
+        return torch.cat([gnn_emb.detach(), scalar])
+
+    def forward_from_embeddings(
+        self,
+        op_h: torch.Tensor,
+        machine_h: torch.Tensor,
+        actions: list,
+        op_id_to_idx: dict,
+        job_op_map: dict,
+        c_p: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """사전 계산된 임베딩으로 Assembly Q-값 산출 — MLP 한 번 호출."""
+        device   = op_h.device
+        asm_acts = [a for a in actions if _is_assembly(a)]
+        if not asm_acts:
+            return torch.zeros(1, device=device)
+
+        graph_emb = torch.cat([op_h.mean(dim=0), machine_h.mean(dim=0)])
+        zero_h    = torch.zeros(self.hidden_dim, device=device)
+        if c_p is None:
+            c_p = torch.zeros(self.cross_dim, device=device)
+
+        valid_inps, valid_locals = [], []
+        for local_i, (comp_job_ids, mid) in enumerate(asm_acts):
+            if mid >= machine_h.size(0):
+                continue
+            comp_embs, valid = [], True
+            for job_id in comp_job_ids:
+                idx = self._get_job_last_op_idx(job_id, op_id_to_idx, job_op_map)
+                if idx is None:
+                    valid = False; break
+                comp_embs.append(op_h[idx] if idx < op_h.size(0) else zero_h)
+            if not valid:
+                continue
+            comp_pool = torch.stack(comp_embs).mean(dim=0)
+            inp = torch.cat([comp_pool, machine_h[mid], graph_emb, c_p])
+            valid_inps.append(inp)
+            valid_locals.append(local_i)
+
+        if not valid_inps:
+            return torch.full((len(asm_acts),), -1e9, device=device)
+
+        q_computed = self.q_asm_mlp(torch.stack(valid_inps)).squeeze(-1)
+
+        if len(valid_locals) == len(asm_acts):
+            return q_computed
+
+        valid_set = set(valid_locals)
+        q_full, ptr = [], 0
+        for local_i in range(len(asm_acts)):
+            if local_i in valid_set:
+                q_full.append(q_computed[ptr]); ptr += 1
+            else:
+                q_full.append(torch.tensor(-1e9, device=device))
+        return torch.stack(q_full)
+
 
 # ──────────────────────────────────────────────────────────
 # DualDQNAgent
@@ -463,7 +719,10 @@ class DualDQNAgent:
         return u_p.detach()
 
     def select_action(self, obs: dict) -> int:
-        """ε-greedy: ε 확률 랜덤, 나머지는 두 네트워크 Q값 통합 argmax."""
+        """ε-greedy: ε 확률 랜덤, 나머지는 두 네트워크 Q값 통합 argmax.
+
+        각 인코더를 1회만 호출해 교차 신호(C_p/U_p)와 Q-값을 모두 계산.
+        """
         actions = obs["actions"]
         if not actions:
             return 0
@@ -471,26 +730,35 @@ class DualDQNAgent:
             return random.randint(0, len(actions) - 1)
 
         graph, _, prec, op_id_to_idx, job_op_map = self._parse_obs(obs)
-        c_p = self._compute_c_p(obs, use_target=False)
-        u_p = self._compute_u_p(obs, use_target=False)
 
-        reg_idx = [i for i, a in enumerate(actions) if not _is_assembly(a)]
-        asm_idx = [i for i, a in enumerate(actions) if     _is_assembly(a)]
-        q_all   = torch.full((len(actions),), -1e9, device=self.device)
+        with torch.no_grad():
+            # reg_online 인코더 1회 → C_p + Q_reg 공용
+            op_h_reg, machine_h_reg = self.reg_online.encoder(graph, prec, op_id_to_idx, self.device)
+            # asm_online 인코더 1회 → U_p + Q_asm 공용
+            op_h_asm, machine_h_asm = self.asm_online.encoder(graph, prec, op_id_to_idx, self.device)
 
-        if reg_idx:
-            with torch.no_grad():
-                q_reg = self.reg_online(graph, actions, prec, op_id_to_idx, u_p=u_p)
-            for local_i, global_i in enumerate(reg_idx):
-                if local_i < q_reg.size(0):
-                    q_all[global_i] = q_reg[local_i]
+            c_p = self.reg_online.compute_C_p_from_embeddings(op_h_reg, obs)
+            u_p = self.asm_online.compute_U_p_from_embeddings(op_h_asm, graph, obs)
 
-        if asm_idx:
-            with torch.no_grad():
-                q_asm = self.asm_online(graph, actions, prec, op_id_to_idx, job_op_map, c_p=c_p)
-            for local_i, global_i in enumerate(asm_idx):
-                if local_i < q_asm.size(0):
-                    q_all[global_i] = q_asm[local_i]
+            reg_idx = [i for i, a in enumerate(actions) if not _is_assembly(a)]
+            asm_idx = [i for i, a in enumerate(actions) if     _is_assembly(a)]
+            q_all   = torch.full((len(actions),), -1e9, device=self.device)
+
+            if reg_idx:
+                q_reg = self.reg_online.forward_from_embeddings(
+                    op_h_reg, machine_h_reg, actions, graph, op_id_to_idx, u_p=u_p
+                )
+                for local_i, global_i in enumerate(reg_idx):
+                    if local_i < q_reg.size(0):
+                        q_all[global_i] = q_reg[local_i]
+
+            if asm_idx:
+                q_asm = self.asm_online.forward_from_embeddings(
+                    op_h_asm, machine_h_asm, actions, op_id_to_idx, job_op_map, c_p=c_p
+                )
+                for local_i, global_i in enumerate(asm_idx):
+                    if local_i < q_asm.size(0):
+                        q_all[global_i] = q_asm[local_i]
 
         return int(q_all.argmax().item())
 
@@ -550,7 +818,11 @@ class DualDQNAgent:
         return {"loss_reg": loss.item()}
 
     def update_regular_batch(self, batch: list) -> dict:
-        """reg_buffer 샘플 배치로 Regular 네트워크 업데이트. Huber loss 사용."""
+        """reg_buffer 샘플 배치로 Regular 네트워크 업데이트.
+
+        Stage 1: 4회 batched GNN 인코딩 (개별 ~192회 → 4회)
+        Stage 2: forward_from_embeddings로 MLP 벡터화
+        """
         reg_steps = [
             (obs, act, r, nobs, done)
             for obs, act, r, nobs, done in batch
@@ -559,16 +831,33 @@ class DualDQNAgent:
         if not reg_steps:
             return {"loss_reg": 0.0}
 
+        parsed_obs  = [self._parse_obs(obs)  for obs, _, _, _, _    in reg_steps]
+        parsed_nobs = [self._parse_obs(nobs) for _, _, _, nobs, _ in reg_steps]
+        obs_info    = [(g, p, o) for g, _, p, o, _ in parsed_obs]
+        nobs_info   = [(g, p, o) for g, _, p, o, _ in parsed_nobs]
+
+        # 4회 batched 인코더 호출
         self.reg_optimizer.zero_grad()
+        with torch.no_grad():
+            asm_online_obs  = self.asm_online.encoder.forward_batch(obs_info,  self.device)
+            reg_target_nobs = self.reg_target.encoder.forward_batch(nobs_info, self.device)
+            asm_target_nobs = self.asm_target.encoder.forward_batch(nobs_info, self.device)
+        reg_online_obs = self.reg_online.encoder.forward_batch(obs_info, self.device)
+
         losses = []
+        for i, (obs, action_idx, reward, next_obs, done) in enumerate(reg_steps):
+            graph, actions, prec, op_id_to_idx, _ = parsed_obs[i]
+            op_h_asm, _             = asm_online_obs[i]
+            op_h_reg, machine_h_reg = reg_online_obs[i]
 
-        for obs, action_idx, reward, next_obs, done in reg_steps:
-            graph, actions, prec, op_id_to_idx, _ = self._parse_obs(obs)
-            u_p = self._compute_u_p(obs, use_target=False)
+            with torch.no_grad():
+                u_p = self.asm_online.compute_U_p_from_embeddings(op_h_asm, graph, obs)
 
-            q_vals = self.reg_online(graph, actions, prec, op_id_to_idx, u_p=u_p)
+            q_vals = self.reg_online.forward_from_embeddings(
+                op_h_reg, machine_h_reg, actions, graph, op_id_to_idx, u_p=u_p
+            )
 
-            reg_global = [i for i, a in enumerate(actions) if not _is_assembly(a)]
+            reg_global = [j for j, a in enumerate(actions) if not _is_assembly(a)]
             if action_idx not in reg_global:
                 continue
             local_idx = min(reg_global.index(action_idx), q_vals.size(0) - 1)
@@ -577,17 +866,25 @@ class DualDQNAgent:
             if done or not next_obs["actions"]:
                 target = torch.tensor(float(reward), device=self.device)
             else:
-                ng, na, np_, noi, njm = self._parse_obs(next_obs)
-                nu_p = self._compute_u_p(next_obs, use_target=True)
-                nc_p = self._compute_c_p(next_obs, use_target=True)
+                ng, na, np_, noi, njm = parsed_nobs[i]
+                op_h_reg_t, machine_h_reg_t = reg_target_nobs[i]
+                op_h_asm_t, machine_h_asm_t = asm_target_nobs[i]
+
                 next_reg = [a for a in na if not _is_assembly(a)]
                 next_asm = [a for a in na if     _is_assembly(a)]
+
                 with torch.no_grad():
-                    nq_reg = (self.reg_target(ng, na, np_, noi, u_p=nu_p).max()
+                    nu_p = self.asm_target.compute_U_p_from_embeddings(op_h_asm_t, ng, next_obs)
+                    nc_p = self.reg_target.compute_C_p_from_embeddings(op_h_reg_t, next_obs)
+                    nq_reg = (self.reg_target.forward_from_embeddings(
+                                  op_h_reg_t, machine_h_reg_t, na, ng, noi, u_p=nu_p
+                              ).max()
                               if next_reg else torch.tensor(-1e9, device=self.device))
-                    nq_asm = (self.asm_target(ng, na, np_, noi, njm, c_p=nc_p).max()
+                    nq_asm = (self.asm_target.forward_from_embeddings(
+                                  op_h_asm_t, machine_h_asm_t, na, noi, njm, c_p=nc_p
+                              ).max()
                               if next_asm else torch.tensor(-1e9, device=self.device))
-                next_val = torch.max(nq_reg, nq_asm)
+                    next_val = torch.max(nq_reg, nq_asm)
                 target = torch.tensor(float(reward), device=self.device) + self.gamma * next_val
 
             losses.append(F.smooth_l1_loss(q_val, target.detach()))
@@ -602,7 +899,11 @@ class DualDQNAgent:
         return {"loss_reg": loss.item()}
 
     def update_assembly_batch(self, batch: list) -> dict:
-        """asm_buffer 샘플 배치로 Assembly 네트워크 업데이트. Huber loss 사용."""
+        """asm_buffer 샘플 배치로 Assembly 네트워크 업데이트.
+
+        Stage 1: 4회 batched GNN 인코딩
+        Stage 2: forward_from_embeddings로 MLP 벡터화
+        """
         asm_steps = [
             (obs, act, r, nobs, done)
             for obs, act, r, nobs, done in batch
@@ -611,16 +912,33 @@ class DualDQNAgent:
         if not asm_steps:
             return {"loss_asm": 0.0}
 
+        parsed_obs  = [self._parse_obs(obs)  for obs, _, _, _, _    in asm_steps]
+        parsed_nobs = [self._parse_obs(nobs) for _, _, _, nobs, _ in asm_steps]
+        obs_info    = [(g, p, o) for g, _, p, o, _ in parsed_obs]
+        nobs_info   = [(g, p, o) for g, _, p, o, _ in parsed_nobs]
+
+        # 4회 batched 인코더 호출
         self.asm_optimizer.zero_grad()
+        with torch.no_grad():
+            reg_online_obs  = self.reg_online.encoder.forward_batch(obs_info,  self.device)
+            reg_target_nobs = self.reg_target.encoder.forward_batch(nobs_info, self.device)
+            asm_target_nobs = self.asm_target.encoder.forward_batch(nobs_info, self.device)
+        asm_online_obs = self.asm_online.encoder.forward_batch(obs_info, self.device)
+
         losses = []
+        for i, (obs, action_idx, reward, next_obs, done) in enumerate(asm_steps):
+            graph, actions, prec, op_id_to_idx, job_op_map = parsed_obs[i]
+            op_h_reg, _             = reg_online_obs[i]
+            op_h_asm, machine_h_asm = asm_online_obs[i]
 
-        for obs, action_idx, reward, next_obs, done in asm_steps:
-            graph, actions, prec, op_id_to_idx, job_op_map = self._parse_obs(obs)
-            c_p = self._compute_c_p(obs, use_target=False)
+            with torch.no_grad():
+                c_p = self.reg_online.compute_C_p_from_embeddings(op_h_reg, obs)
 
-            q_vals = self.asm_online(graph, actions, prec, op_id_to_idx, job_op_map, c_p=c_p)
+            q_vals = self.asm_online.forward_from_embeddings(
+                op_h_asm, machine_h_asm, actions, op_id_to_idx, job_op_map, c_p=c_p
+            )
 
-            asm_global = [i for i, a in enumerate(actions) if _is_assembly(a)]
+            asm_global = [j for j, a in enumerate(actions) if _is_assembly(a)]
             if action_idx not in asm_global:
                 continue
             local_idx = min(asm_global.index(action_idx), q_vals.size(0) - 1)
@@ -629,17 +947,25 @@ class DualDQNAgent:
             if done or not next_obs["actions"]:
                 target = torch.tensor(float(reward), device=self.device)
             else:
-                ng, na, np_, noi, njm = self._parse_obs(next_obs)
-                nc_p = self._compute_c_p(next_obs, use_target=True)
-                nu_p = self._compute_u_p(next_obs, use_target=True)
+                ng, na, np_, noi, njm = parsed_nobs[i]
+                op_h_reg_t, machine_h_reg_t = reg_target_nobs[i]
+                op_h_asm_t, machine_h_asm_t = asm_target_nobs[i]
+
                 next_reg = [a for a in na if not _is_assembly(a)]
                 next_asm = [a for a in na if     _is_assembly(a)]
+
                 with torch.no_grad():
-                    nq_reg = (self.reg_target(ng, na, np_, noi, u_p=nu_p).max()
+                    nc_p = self.reg_target.compute_C_p_from_embeddings(op_h_reg_t, next_obs)
+                    nu_p = self.asm_target.compute_U_p_from_embeddings(op_h_asm_t, ng, next_obs)
+                    nq_reg = (self.reg_target.forward_from_embeddings(
+                                  op_h_reg_t, machine_h_reg_t, na, ng, noi, u_p=nu_p
+                              ).max()
                               if next_reg else torch.tensor(-1e9, device=self.device))
-                    nq_asm = (self.asm_target(ng, na, np_, noi, njm, c_p=nc_p).max()
+                    nq_asm = (self.asm_target.forward_from_embeddings(
+                                  op_h_asm_t, machine_h_asm_t, na, noi, njm, c_p=nc_p
+                              ).max()
                               if next_asm else torch.tensor(-1e9, device=self.device))
-                next_val = torch.max(nq_reg, nq_asm)
+                    next_val = torch.max(nq_reg, nq_asm)
                 target = torch.tensor(float(reward), device=self.device) + self.gamma * next_val
 
             losses.append(F.smooth_l1_loss(q_val, target.detach()))
