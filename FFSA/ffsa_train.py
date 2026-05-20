@@ -115,7 +115,7 @@ def run_eval(agent: DualDQNAgent, eval_envs: list) -> float:
 def train(
     config: InstanceConfig,
     num_episodes: int = 500,
-    buffer_size: int = 50000,
+    buffer_size: int = 10000,
     batch_size: int = 64,
     train_freq: int = 4,
     learn_start: int = 1000,
@@ -373,7 +373,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FFSA Dual DQN 학습")
     parser.add_argument("--step",               type=int,   default=1, choices=[1, 2, 3])
     parser.add_argument("--episodes",           type=int,   default=300)
-    parser.add_argument("--buffer-size",        type=int,   default=50000)
+    parser.add_argument("--buffer-size",        type=int,   default=10000)
     parser.add_argument("--batch-size",         type=int,   default=64)
     parser.add_argument("--train-freq",         type=int,   default=4)
     parser.add_argument("--learn-start",        type=int,   default=1000)
