@@ -29,7 +29,7 @@ python ffsa_train_dispatch.py --step 3 --episodes 1000 --hidden-dim 16 --device 
     # 정규주문 (t=0 도착)
     num_regular_orders: int = 8
     regular_quantity_range: Tuple[int, int] = (1, 5)
-    regular_due_date_range: Tuple[float, float] = (600.0, 1400.0)
+    regular_due_date_range: Tuple[float, float] = (500.0, 1100.0)
     # 긴급주문 (포아송 프로세스, 실시간 생성)
     num_urgent_orders: int = 2                             # 에피소드당 최대 긴급주문 수
     urgent_inter_arrival_mean: float = 150.0               # 평균 도착 간격 (1/λ)
