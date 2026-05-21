@@ -23,6 +23,8 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch as PyGBatch
 from torch_geometric.nn import GATConv
 
+from ffsa_env import OpFeat
+
 RegularAction = Tuple[int, int]
 AssemblyAction = Tuple[Tuple[int, ...], int]
 Action = Union[RegularAction, AssemblyAction]
@@ -247,7 +249,7 @@ class RegularQNetwork(nn.Module):
       = 5*hd + 5
     """
 
-    def __init__(self, op_feat_dim=9, machine_feat_dim=6, edge_feat_dim=2,
+    def __init__(self, op_feat_dim=OpFeat.DIM, machine_feat_dim=6, edge_feat_dim=2,
                  hidden_dim=16, num_layers=2, mlp_hidden=128):
         super().__init__()
         self.hidden_dim    = hidden_dim
@@ -444,7 +446,7 @@ class AssemblyQNetwork(nn.Module):
       = 5*hd + 3
     """
 
-    def __init__(self, op_feat_dim=9, machine_feat_dim=6, edge_feat_dim=2,
+    def __init__(self, op_feat_dim=OpFeat.DIM, machine_feat_dim=6, edge_feat_dim=2,
                  hidden_dim=16, num_layers=2, mlp_hidden=128):
         super().__init__()
         self.hidden_dim    = hidden_dim
@@ -522,9 +524,9 @@ class AssemblyQNetwork(nn.Module):
 
         urgency_score = 0.0
         if op_x.size(0) > 0:
-            is_asm   = op_x[:, 3]
-            due_norm = op_x[:, 7]
-            wt_norm  = op_x[:, 8]
+            is_asm   = op_x[:, OpFeat.IS_ASSEMBLY]
+            due_norm = op_x[:, OpFeat.DUE_DATE_NORM]
+            wt_norm  = op_x[:, OpFeat.WEIGHT_NORM]
             mask     = is_asm > 0.5
             if mask.any():
                 urgency_score = float(
@@ -566,9 +568,9 @@ class AssemblyQNetwork(nn.Module):
 
         urgency_score = 0.0
         if op_x.size(0) > 0:
-            is_asm   = op_x[:, 3]
-            due_norm = op_x[:, 7]
-            wt_norm  = op_x[:, 8]
+            is_asm   = op_x[:, OpFeat.IS_ASSEMBLY]
+            due_norm = op_x[:, OpFeat.DUE_DATE_NORM]
+            wt_norm  = op_x[:, OpFeat.WEIGHT_NORM]
             mask     = is_asm > 0.5
             if mask.any():
                 urgency_score = float(

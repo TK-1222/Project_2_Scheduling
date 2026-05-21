@@ -25,7 +25,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from ffsa_instance import InstanceConfig, full_config
-from ffsa_env import FFSASchedulingEnv
+from ffsa_env import FFSASchedulingEnv, OpFeat
 from ffsa_model import RegularQNetwork, AssemblyQNetwork, DualDQNAgent, ReplayBuffer, _is_assembly
 from ffsa_viz import log_hetero_graph_to_tensorboard
 
@@ -160,11 +160,11 @@ def train(
     env    = FFSASchedulingEnv(config)
 
     reg_net = RegularQNetwork(
-        op_feat_dim=9, machine_feat_dim=6, edge_feat_dim=2,
+        op_feat_dim=OpFeat.DIM, machine_feat_dim=6, edge_feat_dim=2,
         hidden_dim=hidden_dim, num_layers=2, mlp_hidden=128,
     )
     asm_net = AssemblyQNetwork(
-        op_feat_dim=9, machine_feat_dim=6, edge_feat_dim=2,
+        op_feat_dim=OpFeat.DIM, machine_feat_dim=6, edge_feat_dim=2,
         hidden_dim=hidden_dim, num_layers=2, mlp_hidden=128,
     )
     agent = DualDQNAgent(

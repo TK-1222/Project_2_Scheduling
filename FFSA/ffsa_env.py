@@ -11,6 +11,7 @@ Reward: r = -Δ(실제 완료된 주문의 가중 지연)
 """
 
 from dataclasses import dataclass, field
+from enum import IntEnum
 from typing import Dict, List, Optional, Tuple, Set, Union
 import numpy as np
 import gymnasium as gym
@@ -23,6 +24,20 @@ from ffsa_instance import (
     InstanceConfig, FFSAInstance, generate_instance,
     OrderData, ProductData, JobData, MachineData,
 )
+
+# Op 노드 피처 인덱스 — 이 enum이 op_x 텐서의 유일한 스키마 정의
+class OpFeat(IntEnum):
+    IS_DONE        = 0
+    IS_READY       = 1
+    IS_PROCESSING  = 2
+    IS_ASSEMBLY    = 3
+    BUFFER_WAITING = 4
+    STAGE_NORM     = 5
+    PRODUCT_NORM   = 6
+    DUE_DATE_NORM  = 7
+    WEIGHT_NORM    = 8
+    DIM            = 9
+
 
 # Action 타입 정의
 RegularAction = Tuple[int, int]                    # (op_id, machine_id)
@@ -137,28 +152,25 @@ class GraphBuilder:
         return data
 
     def _build_op_features(self, env: "FFSASchedulingEnv") -> torch.Tensor:
-        """Operation Node Feature: 9차원
-        0: is_done, 1: is_ready, 2: is_processing, 3: is_assembly, 4: buffer_waiting
-        5: stage_norm, 6: product_norm, 7: due_date_norm, 8: weight_norm
-        """
+        """Operation Node Feature: OpFeat.DIM 차원 (OpFeat enum 참조)"""
         active_ops = [op for op in env.operations.values() if op.active]
         num_ops = len(active_ops)
         if num_ops == 0:
-            return torch.zeros((0, 9), dtype=torch.float32)
+            return torch.zeros((0, OpFeat.DIM), dtype=torch.float32)
 
-        feats = np.zeros((num_ops, 9), dtype=np.float32)
+        feats = np.zeros((num_ops, OpFeat.DIM), dtype=np.float32)
 
         for idx, op in enumerate(active_ops):
-            feats[idx, 0] = float(op.is_done)
-            feats[idx, 1] = float(op.is_ready)
-            feats[idx, 2] = float(op.is_processing)
-            feats[idx, 3] = float(op.is_assembly)
-            feats[idx, 4] = float(op.buffer_waiting)
-            feats[idx, 5] = op.stage_id / max(self.inst.num_stages - 1, 1)
-            feats[idx, 6] = op.product_id / max(self.inst.num_products - 1, 1)
+            feats[idx, OpFeat.IS_DONE]        = float(op.is_done)
+            feats[idx, OpFeat.IS_READY]       = float(op.is_ready)
+            feats[idx, OpFeat.IS_PROCESSING]  = float(op.is_processing)
+            feats[idx, OpFeat.IS_ASSEMBLY]    = float(op.is_assembly)
+            feats[idx, OpFeat.BUFFER_WAITING] = float(op.buffer_waiting)
+            feats[idx, OpFeat.STAGE_NORM]     = op.stage_id / max(self.inst.num_stages - 1, 1)
+            feats[idx, OpFeat.PRODUCT_NORM]   = op.product_id / max(self.inst.num_products - 1, 1)
             job = self.inst.jobs[op.job_id]
-            feats[idx, 7] = job.due_date / self.max_due if self.max_due > 0 else 0.0
-            feats[idx, 8] = self.inst.products[op.product_id].weight / self.max_weight if self.max_weight > 0 else 0.0
+            feats[idx, OpFeat.DUE_DATE_NORM]  = job.due_date / self.max_due if self.max_due > 0 else 0.0
+            feats[idx, OpFeat.WEIGHT_NORM]    = self.inst.products[op.product_id].weight / self.max_weight if self.max_weight > 0 else 0.0
 
         return torch.tensor(feats)
 
