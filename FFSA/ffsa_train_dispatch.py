@@ -121,7 +121,7 @@ def train(
     batch_size: int = 64,
     train_freq: int = 4,
     learn_start: int = 1000,
-    target_update_freq: int = 100,
+    tau: float = 0.005,
     lr: float = 2e-4,
     gamma: float = 1.0,
     epsilon_start: float = 1.0,
@@ -152,7 +152,7 @@ def train(
     print(f"  Episodes: {num_episodes}")
     print(f"  Replay Buffer: reg/asm 별도 | 크기={buffer_size} | 배치={batch_size}")
     print(f"  학습 주기: {train_freq} 스텝마다 | 워밍업: {learn_start} transitions")
-    print(f"  Target 업데이트: {target_update_freq} 업데이트마다")
+    print(f"  Target 업데이트: Soft update (τ={tau}, 매 학습 스텝)")
     print(f"  ε: {epsilon_start} → {epsilon_min} (decay={epsilon_decay})")
     print(f"  TensorBoard: runs/{exp_name}")
     print(f"{'='*60}")
@@ -183,13 +183,11 @@ def train(
     episode_makespans = []
     episode_deadlocks = []
 
-    global_step      = 0
-    reg_update_count = 0
-    asm_update_count = 0
+    global_step   = 0
     metrics_reg: dict = {}
     metrics_asm: dict = {}
-    last_reg_loss    = 0.0
-    last_asm_loss    = 0.0
+    last_reg_loss = 0.0
+    last_asm_loss = 0.0
 
     save_dir     = f"runs/{exp_name}/checkpoints"
     os.makedirs(save_dir, exist_ok=True)
@@ -200,9 +198,6 @@ def train(
         done         = False
         total_reward = 0.0
         ep_deadlock  = False
-
-        reg_target_updated = False
-        asm_target_updated = False
 
         while not done:
             if not obs["actions"]:
@@ -233,31 +228,21 @@ def train(
                 reg_buffer.push(obs, dl_act, -1000.0, obs, True)
                 break
 
-            # train_freq 스텝마다 배치 학습
+            # train_freq 스텝마다 배치 학습 + soft target update
             if global_step % train_freq == 0:
                 if len(reg_buffer) >= learn_start:
-                    batch       = reg_buffer.sample(batch_size)
-                    metrics_reg = agent.update_regular_batch(batch)
+                    batch         = reg_buffer.sample(batch_size)
+                    metrics_reg   = agent.update_regular_batch(batch)
                     last_reg_loss = metrics_reg.get("loss_reg", 0.0)
-                    reg_update_count += 1
-                    if reg_update_count % target_update_freq == 0:
-                        agent.update_regular_target()
-                        reg_target_updated = True
+                    agent.update_regular_target(tau=tau)
 
                 if len(asm_buffer) >= learn_start:
-                    batch       = asm_buffer.sample(batch_size)
-                    metrics_asm = agent.update_assembly_batch(batch)
+                    batch         = asm_buffer.sample(batch_size)
+                    metrics_asm   = agent.update_assembly_batch(batch)
                     last_asm_loss = metrics_asm.get("loss_asm", 0.0)
-                    asm_update_count += 1
-                    if asm_update_count % target_update_freq == 0:
-                        agent.update_assembly_target()
-                        asm_target_updated = True
+                    agent.update_assembly_target(tau=tau)
 
                 logger.log_train_step(global_step, last_reg_loss, last_asm_loss)
-                if reg_target_updated or asm_target_updated:
-                    logger.log_train_target(global_step, reg_target_updated, asm_target_updated)
-                    reg_target_updated = False
-                    asm_target_updated = False
 
         wt = env.get_actual_weighted_tardiness()
         ms = env.get_makespan()
@@ -379,7 +364,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size",         type=int,   default=64)
     parser.add_argument("--train-freq",         type=int,   default=4)
     parser.add_argument("--learn-start",        type=int,   default=1000)
-    parser.add_argument("--target-update-freq", type=int,   default=100)
+    parser.add_argument("--tau",                type=float, default=0.005)
     parser.add_argument("--lr",                 type=float, default=2e-4)
     parser.add_argument("--gamma",              type=float, default=1.0)
     parser.add_argument("--epsilon-start",      type=float, default=1.0)
@@ -419,7 +404,7 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             train_freq=args.train_freq,
             learn_start=args.learn_start,
-            target_update_freq=args.target_update_freq,
+            tau=args.tau,
             lr=args.lr,
             gamma=args.gamma,
             epsilon_start=args.epsilon_start,
