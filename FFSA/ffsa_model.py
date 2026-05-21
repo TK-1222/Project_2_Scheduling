@@ -247,7 +247,7 @@ class RegularQNetwork(nn.Module):
       = 5*hd + 5
     """
 
-    def __init__(self, op_feat_dim=10, machine_feat_dim=6, edge_feat_dim=2,
+    def __init__(self, op_feat_dim=9, machine_feat_dim=6, edge_feat_dim=2,
                  hidden_dim=16, num_layers=2, mlp_hidden=128):
         super().__init__()
         self.hidden_dim    = hidden_dim
@@ -444,7 +444,7 @@ class AssemblyQNetwork(nn.Module):
       = 5*hd + 3
     """
 
-    def __init__(self, op_feat_dim=10, machine_feat_dim=6, edge_feat_dim=2,
+    def __init__(self, op_feat_dim=9, machine_feat_dim=6, edge_feat_dim=2,
                  hidden_dim=16, num_layers=2, mlp_hidden=128):
         super().__init__()
         self.hidden_dim    = hidden_dim
