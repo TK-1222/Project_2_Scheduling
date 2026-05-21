@@ -355,28 +355,5 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
     )
 
 
-# ──────────────────────────────────────────────────────────
-# Preset 설정
-# ──────────────────────────────────────────────────────────
-
-def simple_config(**kwargs) -> InstanceConfig:
-    """Step 1: 단순 FFSA (assembly 없음, setup 없음, 무한 버퍼)"""
-    defaults = dict(
-        num_stages=8, machines_per_stage=[3, 3, 3, 3, 3, 3, 3, 3],
-        use_assembly=False, use_setup=False, use_finite_buffer=False,
-        num_urgent_orders=0,
-    )
-    defaults.update(kwargs)
-    return InstanceConfig(**defaults)
-
-
-def assembly_config(**kwargs) -> InstanceConfig:
-    """Step 2: Assembly 포함 (스케일업 기본값 사용)"""
-    defaults = dict(use_setup=False, use_finite_buffer=False)
-    defaults.update(kwargs)
-    return InstanceConfig(**defaults)
-
-
 def full_config(**kwargs) -> InstanceConfig:
-    """Step 3: Setup + Buffer 포함 (스케일업 기본값 사용)"""
     return InstanceConfig(**kwargs)

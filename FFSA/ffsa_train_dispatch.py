@@ -9,11 +9,11 @@ Dual Q-Network (RegularQNetwork + AssemblyQNetwork) Q-value 기반 선택.
   - Regular + Assembly: 각 버퍼에서 독립적으로 배치 샘플링 후 업데이트
   - train_freq 환경 스텝마다 업데이트 시도
   - learn_start transitions 이상 쌓인 후 학습 시작
-  - Target: 각 네트워크 target_update_freq 업데이트마다 독립적으로 갱신
+  - Target: Soft update (τ=0.005, 매 학습 스텝) — Polyak averaging
 
-인스턴스 전략:
-  - 학습: 실행 시작 시 시드를 랜덤 추출 → 전체 에피소드 동일 인스턴스 사용
-  - 평가: 고정 시드 인스턴스 (--eval-seeds) → 일반화 성능 확인용 (선택)
+인스턴스 설정:
+  - ffsa_instance.py InstanceConfig 기본값이 유일한 설정 소스
+  - 인스턴스 변경 시 InstanceConfig 기본값만 수정
 
 모니터링: TensorBoard
   tensorboard --logdir runs/
