@@ -119,9 +119,10 @@ def train(
     batch_size: int = 64,
     train_freq: int = 4,
     learn_start: int = 1000,
+    asm_learn_start: int = 200,
     tau: float = 0.005,
     lr: float = 2e-4,
-    gamma: float = 1.0,
+    gamma: float = 0.99,
     epsilon_start: float = 1.0,
     epsilon_min: float = 0.05,
     epsilon_decay: float = 0.995,
@@ -234,8 +235,8 @@ def train(
                     last_reg_loss = metrics_reg.get("loss_reg", 0.0)
                     agent.update_regular_target(tau=tau)
 
-                if len(asm_buffer) >= learn_start:
-                    batch         = asm_buffer.sample(batch_size)
+                if len(asm_buffer) >= asm_learn_start:
+                    batch         = asm_buffer.sample(min(batch_size, len(asm_buffer)))
                     metrics_asm   = agent.update_assembly_batch(batch)
                     last_asm_loss = metrics_asm.get("loss_asm", 0.0)
                     agent.update_assembly_target(tau=tau)
@@ -352,9 +353,10 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size",         type=int,   default=64)
     parser.add_argument("--train-freq",         type=int,   default=4)
     parser.add_argument("--learn-start",        type=int,   default=1000)
+    parser.add_argument("--asm-learn-start",    type=int,   default=200)
     parser.add_argument("--tau",                type=float, default=0.005)
     parser.add_argument("--lr",                 type=float, default=2e-4)
-    parser.add_argument("--gamma",              type=float, default=1.0)
+    parser.add_argument("--gamma",              type=float, default=0.99)
     parser.add_argument("--epsilon-start",      type=float, default=1.0)
     parser.add_argument("--epsilon-min",        type=float, default=0.05)
     parser.add_argument("--epsilon-decay",      type=float, default=0.995)
@@ -390,6 +392,7 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             train_freq=args.train_freq,
             learn_start=args.learn_start,
+            asm_learn_start=args.asm_learn_start,
             tau=args.tau,
             lr=args.lr,
             gamma=args.gamma,

@@ -523,12 +523,12 @@ class AssemblyQNetwork(nn.Module):
         urgency_score = 0.0
         if op_x.size(0) > 0:
             is_asm   = op_x[:, 3]
-            due_norm = op_x[:, 8]
-            wt_norm  = op_x[:, 9]
+            due_norm = op_x[:, 7]
+            wt_norm  = op_x[:, 8]
             mask     = is_asm > 0.5
             if mask.any():
                 urgency_score = float(
-                    (wt_norm[mask] / (due_norm[mask] + 0.01)).mean().item()
+                    (wt_norm[mask] * (1.0 - due_norm[mask])).mean().item()
                 )
 
         if assembly_pool:
@@ -567,12 +567,12 @@ class AssemblyQNetwork(nn.Module):
         urgency_score = 0.0
         if op_x.size(0) > 0:
             is_asm   = op_x[:, 3]
-            due_norm = op_x[:, 8]
-            wt_norm  = op_x[:, 9]
+            due_norm = op_x[:, 7]
+            wt_norm  = op_x[:, 8]
             mask     = is_asm > 0.5
             if mask.any():
                 urgency_score = float(
-                    (wt_norm[mask] / (due_norm[mask] + 0.01)).mean().item()
+                    (wt_norm[mask] * (1.0 - due_norm[mask])).mean().item()
                 )
 
         shortage_rate = (
