@@ -9,11 +9,11 @@ Dual Q-Network (RegularQNetwork + AssemblyQNetwork) Q-value 기반 선택.
   - Regular + Assembly: 각 버퍼에서 독립적으로 배치 샘플링 후 업데이트
   - train_freq 환경 스텝마다 업데이트 시도
   - learn_start transitions 이상 쌓인 후 학습 시작
-  - Target: 각 네트워크 target_update_freq 업데이트마다 독립적으로 갱신
+  - Target: Soft update (τ=0.005, 매 학습 스텝) — Polyak averaging
 
-인스턴스 전략:
-  - 학습: 실행 시작 시 시드를 랜덤 추출 → 전체 에피소드 동일 인스턴스 사용
-  - 평가: 고정 시드 인스턴스 (--eval-seeds) → 일반화 성능 확인용 (선택)
+인스턴스 설정:
+  - ffsa_instance.py InstanceConfig 기본값이 유일한 설정 소스
+  - 인스턴스 변경 시 InstanceConfig 기본값만 수정
 
 모니터링: TensorBoard
   tensorboard --logdir runs/
@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from ffsa_instance import InstanceConfig, simple_config, assembly_config, full_config
+from ffsa_instance import InstanceConfig, full_config
 from ffsa_env_dispatch import FFSASchedulingEnv
 from ffsa_model import RegularQNetwork, AssemblyQNetwork, DualDQNAgent, ReplayBuffer, _is_assembly
 from ffsa_viz import log_hetero_graph_to_tensorboard
@@ -347,18 +347,8 @@ def test_random_agent(config: InstanceConfig, num_episodes: int = 5):
 # Entry Point
 # ──────────────────────────────────────────────────────────
 
-def _make_config(step: int, num_products: int, seed) -> InstanceConfig:
-    if step == 1:
-        return simple_config(num_products=num_products, seed=seed)
-    elif step == 2:
-        return assembly_config(num_products=num_products, seed=seed)
-    else:
-        return full_config(num_products=num_products, seed=seed)
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FFSA Dual DQN (디스패칭) 학습")
-    parser.add_argument("--step",               type=int,   default=1, choices=[1, 2, 3])
     parser.add_argument("--episodes",           type=int,   default=300)
     parser.add_argument("--buffer-size",        type=int,   default=10000)
     parser.add_argument("--batch-size",         type=int,   default=64)
@@ -371,7 +361,6 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon-min",        type=float, default=0.05)
     parser.add_argument("--epsilon-decay",      type=float, default=0.995)
     parser.add_argument("--hidden-dim",         type=int,   default=16)
-    parser.add_argument("--products",           type=int,   default=4)
     parser.add_argument("--device",             type=str,   default="cpu")
     parser.add_argument("--exp-name",           type=str,   default=None)
     parser.add_argument("--test-only",          action="store_true")
@@ -379,17 +368,16 @@ if __name__ == "__main__":
     parser.add_argument("--eval-interval",      type=int,   default=10)
     args = parser.parse_args()
 
-    step_name = {1: "simple", 2: "assembly", 3: "full"}[args.step]
-    exp_name  = args.exp_name or f"dual_dqn_dispatch_{step_name}_buf{args.buffer_size}_lr{args.lr}"
+    exp_name  = args.exp_name or f"dual_dqn_dispatch_buf{args.buffer_size}_lr{args.lr}"
 
     # 학습: 실행마다 랜덤 시드 추출 → 전체 에피소드 동일 인스턴스 사용
     train_seed = random.randint(0, 99999)
     print(f"학습 인스턴스 시드: {train_seed}")
-    config = _make_config(args.step, args.products, seed=train_seed)
+    config = full_config(seed=train_seed)
 
     # 평가: 고정 시드 인스턴스 (일반화 확인용, 선택)
     eval_envs = [
-        FFSASchedulingEnv(_make_config(args.step, args.products, seed=s))
+        FFSASchedulingEnv(full_config(seed=s))
         for s in args.eval_seeds
     ]
 

@@ -20,11 +20,11 @@ import numpy as np
 @dataclass
 class InstanceConfig:
     """FFSA 인스턴스 생성 설정"""
-    num_products: int = 8
-    components_range: Tuple[int, int] = (2, 4)   # 제품별 컴포넌트 수 유니폼 분포 [min, max]
-    num_stages: int = 8
-    assembly_stage_idx: int = 4
-    machines_per_stage: Optional[List[int]] = field(default_factory=lambda: [3, 3, 3, 3, 3, 3, 3, 3])
+    num_products: int = 2
+    components_range: Tuple[int, int] = (2, 3)   # 제품별 컴포넌트 수 유니폼 분포 [min, max]
+    num_stages: int = 6
+    assembly_stage_idx: int = 3
+    machines_per_stage: Optional[List[int]] = field(default_factory=lambda: [3, 3, 3, 3, 3, 3])
     processing_time_range: Tuple[float, float] = (10.0, 60.0)
     setup_time_range: Tuple[float, float] = (10.0, 30.0)
     assembly_setup_time_range: Tuple[float, float] = (30.0, 80.0)
@@ -38,14 +38,14 @@ class InstanceConfig:
     use_finite_buffer: bool = True
     seed: Optional[int] = 42
     # 정규주문 (t=0 도착)
-    num_regular_orders: int = 15
-    regular_quantity_range: Tuple[int, int] = (1, 5)
-    regular_due_date_range: Tuple[float, float] = (300.0, 800.0)
+    num_regular_orders: int = 6
+    regular_quantity_range: Tuple[int, int] = (1, 3)
+    regular_due_date_range: Tuple[float, float] = (600.0, 1400.0)
     # 긴급주문 (포아송 프로세스, 실시간 생성)
-    num_urgent_orders: int = 4                              # 에피소드당 최대 긴급주문 수
+    num_urgent_orders: int = 2                              # 에피소드당 최대 긴급주문 수
     urgent_inter_arrival_mean: float = 150.0               # 평균 도착 간격 (1/λ)
     urgent_quantity_range: Tuple[int, int] = (1, 2)
-    urgent_due_date_offset_range: Tuple[float, float] = (40.0, 100.0)  # arrival + offset
+    urgent_due_date_offset_range: Tuple[float, float] = (80.0, 160.0)  # arrival + offset
 
 
 # ──────────────────────────────────────────────────────────
@@ -355,28 +355,5 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
     )
 
 
-# ──────────────────────────────────────────────────────────
-# Preset 설정
-# ──────────────────────────────────────────────────────────
-
-def simple_config(**kwargs) -> InstanceConfig:
-    """Step 1: 단순 FFSA (assembly 없음, setup 없음, 무한 버퍼)"""
-    defaults = dict(
-        num_stages=8, machines_per_stage=[3, 3, 3, 3, 3, 3, 3, 3],
-        use_assembly=False, use_setup=False, use_finite_buffer=False,
-        num_urgent_orders=0,
-    )
-    defaults.update(kwargs)
-    return InstanceConfig(**defaults)
-
-
-def assembly_config(**kwargs) -> InstanceConfig:
-    """Step 2: Assembly 포함 (스케일업 기본값 사용)"""
-    defaults = dict(use_setup=False, use_finite_buffer=False)
-    defaults.update(kwargs)
-    return InstanceConfig(**defaults)
-
-
 def full_config(**kwargs) -> InstanceConfig:
-    """Step 3: Setup + Buffer 포함 (스케일업 기본값 사용)"""
     return InstanceConfig(**kwargs)
