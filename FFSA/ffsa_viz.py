@@ -221,7 +221,12 @@ def _build_graph_and_pos(env) -> Tuple[nx.DiGraph, dict, list, Dict[int, str]]:
                 # Candidate: ready op에 대해서만 (그래프 과밀 방지)
                 for mid in sorted(env.instance.machines_by_stage.get(sid, [])):
                     m_data = env.instance.machines[mid]
-                    if op.product_id in m_data.compatible_products:
+                    job = env.instance.jobs[op.job_id]
+                    if job.is_component:
+                        compatible = (job.product_id, job.component_type_idx) in m_data.compatible_component_ops
+                    else:
+                        compatible = job.product_id in m_data.compatible_final_ops
+                    if compatible:
                         m_key = f"M{mid}"
                         if m_key in G:
                             G.add_edge(m_key, op_key, etype="candidate",
