@@ -1034,11 +1034,13 @@ class DualDQNAgent:
         self.asm_optimizer.step()
         return {"loss_asm": loss.item()}
 
-    def update_regular_target(self):
-        self.reg_target.load_state_dict(self.reg_online.state_dict())
+    def update_regular_target(self, tau: float = 0.005):
+        for p_t, p_o in zip(self.reg_target.parameters(), self.reg_online.parameters()):
+            p_t.data.copy_(tau * p_o.data + (1 - tau) * p_t.data)
 
-    def update_assembly_target(self):
-        self.asm_target.load_state_dict(self.asm_online.state_dict())
+    def update_assembly_target(self, tau: float = 0.005):
+        for p_t, p_o in zip(self.asm_target.parameters(), self.asm_online.parameters()):
+            p_t.data.copy_(tau * p_o.data + (1 - tau) * p_t.data)
 
     def decay_epsilon(self):
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
