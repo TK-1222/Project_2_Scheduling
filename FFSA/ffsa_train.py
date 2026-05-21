@@ -159,11 +159,11 @@ def train(
     env    = FFSASchedulingEnv(config)
 
     reg_net = RegularQNetwork(
-        op_feat_dim=10, machine_feat_dim=6, edge_feat_dim=2,
+        op_feat_dim=9, machine_feat_dim=6, edge_feat_dim=2,
         hidden_dim=hidden_dim, num_layers=2, mlp_hidden=128,
     )
     asm_net = AssemblyQNetwork(
-        op_feat_dim=10, machine_feat_dim=6, edge_feat_dim=2,
+        op_feat_dim=9, machine_feat_dim=6, edge_feat_dim=2,
         hidden_dim=hidden_dim, num_layers=2, mlp_hidden=128,
     )
     agent = DualDQNAgent(

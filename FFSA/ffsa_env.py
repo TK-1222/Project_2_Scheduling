@@ -137,18 +137,16 @@ class GraphBuilder:
         return data
 
     def _build_op_features(self, env: "FFSASchedulingEnv") -> torch.Tensor:
-        """Operation Node Feature: 10차원
+        """Operation Node Feature: 9차원
         0: is_done, 1: is_ready, 2: is_processing, 3: is_assembly, 4: buffer_waiting
-        5: rem_pred_count, 6: stage_norm, 7: product_norm
-        8: due_date_norm (final job op만), 9: weight_norm
+        5: stage_norm, 6: product_norm, 7: due_date_norm, 8: weight_norm
         """
         active_ops = [op for op in env.operations.values() if op.active]
         num_ops = len(active_ops)
         if num_ops == 0:
-            return torch.zeros((0, 10), dtype=torch.float32)
+            return torch.zeros((0, 9), dtype=torch.float32)
 
-        feats = np.zeros((num_ops, 10), dtype=np.float32)
-        max_pred = max((len(op.predecessors) for op in active_ops), default=1) or 1
+        feats = np.zeros((num_ops, 9), dtype=np.float32)
 
         for idx, op in enumerate(active_ops):
             feats[idx, 0] = float(op.is_done)
@@ -156,14 +154,11 @@ class GraphBuilder:
             feats[idx, 2] = float(op.is_processing)
             feats[idx, 3] = float(op.is_assembly)
             feats[idx, 4] = float(op.buffer_waiting)
-            rem_pred = sum(1 for pid in op.predecessors
-                          if env.operations[pid].active and not env.operations[pid].is_done)
-            feats[idx, 5] = rem_pred / max_pred
-            feats[idx, 6] = op.stage_id / max(self.inst.num_stages - 1, 1)
-            feats[idx, 7] = op.product_id / max(self.inst.num_products - 1, 1)
+            feats[idx, 5] = op.stage_id / max(self.inst.num_stages - 1, 1)
+            feats[idx, 6] = op.product_id / max(self.inst.num_products - 1, 1)
             job = self.inst.jobs[op.job_id]
-            feats[idx, 8] = job.due_date / self.max_due if self.max_due > 0 else 0.0
-            feats[idx, 9] = self.inst.products[op.product_id].weight / self.max_weight if self.max_weight > 0 else 0.0
+            feats[idx, 7] = job.due_date / self.max_due if self.max_due > 0 else 0.0
+            feats[idx, 8] = self.inst.products[op.product_id].weight / self.max_weight if self.max_weight > 0 else 0.0
 
         return torch.tensor(feats)
 
