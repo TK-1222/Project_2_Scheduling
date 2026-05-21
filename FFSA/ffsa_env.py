@@ -169,7 +169,8 @@ class GraphBuilder:
             feats[idx, OpFeat.STAGE_NORM]     = op.stage_id / max(self.inst.num_stages - 1, 1)
             feats[idx, OpFeat.PRODUCT_NORM]   = op.product_id / max(self.inst.num_products - 1, 1)
             job = self.inst.jobs[op.job_id]
-            feats[idx, OpFeat.DUE_DATE_NORM]  = job.due_date / self.max_due if self.max_due > 0 else 0.0
+            slack = max(0.0, job.due_date - env.current_time)
+            feats[idx, OpFeat.DUE_DATE_NORM]  = min(1.0, slack / self.max_due) if self.max_due > 0 else 0.0
             feats[idx, OpFeat.WEIGHT_NORM]    = self.inst.products[op.product_id].weight / self.max_weight if self.max_weight > 0 else 0.0
 
         return torch.tensor(feats)
