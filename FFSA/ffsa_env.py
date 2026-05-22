@@ -123,7 +123,7 @@ class GraphBuilder:
         self.max_due = max(
             (j.due_date for j in instance.jobs.values() if j.due_date > 0), default=1.0
         )
-        self.max_weight = max(p.weight for p in instance.products.values()) if instance.products else 1.0
+        self.max_weight = max(o.weight for o in instance.orders.values()) if instance.orders else 1.0
 
     def build(self, env: "FFSASchedulingEnv") -> HeteroData:
         data = HeteroData()
@@ -171,7 +171,8 @@ class GraphBuilder:
             job = self.inst.jobs[op.job_id]
             slack = max(0.0, job.due_date - env.current_time)
             feats[idx, OpFeat.DUE_DATE_NORM]  = min(1.0, slack / self.max_due) if self.max_due > 0 else 0.0
-            feats[idx, OpFeat.WEIGHT_NORM]    = self.inst.products[op.product_id].weight / self.max_weight if self.max_weight > 0 else 0.0
+            order = self.inst.orders[self.inst.jobs[op.job_id].order_id]
+            feats[idx, OpFeat.WEIGHT_NORM]    = order.weight / self.max_weight if self.max_weight > 0 else 0.0
 
         return torch.tensor(feats)
 
@@ -921,7 +922,7 @@ class FFSASchedulingEnv(gym.Env):
         """완료된 final job에 대해 주문 납기 기준 tardiness 합산"""
         total = 0.0
         for order in self.instance.orders.values():
-            weight = self.instance.products[order.product_id].weight
+            weight = order.weight
             for fid in order.final_job_ids:
                 op_list = self.job_ops[fid]
                 if not op_list:

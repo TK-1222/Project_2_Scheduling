@@ -28,7 +28,6 @@ class InstanceConfig:
     setup_time_range: Tuple[float, float] = (6.0, 12.0)
     assembly_setup_time_range: Tuple[float, float] = (30.0, 30.0)
     buffer_capacity: int = 10
-    weight_range: Tuple[float, float] = (1.0, 5.0)
     machine_stage_prob: float = 0.7    # 기계가 스테이지 처리 가능한 확률
     component_stage_prob: float = 0.7  # 컴포넌트별 스테이지 방문 확률
     final_stage_prob: float = 0.7      # final job 스테이지 방문 확률
@@ -53,6 +52,7 @@ class OrderData:
     product_id: int
     quantity: int
     due_date: float
+    weight: float = 1.0          # 수량과 동일 (수량이 클수록 납기 지연 페널티 큼)
     component_job_ids: List[int] = field(default_factory=list)
     final_job_ids: List[int] = field(default_factory=list)
 
@@ -61,7 +61,6 @@ class OrderData:
 class ProductData:
     """제품 정보"""
     product_id: int
-    weight: float              # wp (tardiness 가중치)
     num_components: int = 2    # 조립에 필요한 컴포넌트 수 (제품마다 다름)
 
 
@@ -141,7 +140,6 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
         )
         products[p] = ProductData(
             product_id=p,
-            weight=float(rng.uniform(*config.weight_range)),
             num_components=num_comp,
         )
 
@@ -156,7 +154,7 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
         due = float(rng.uniform(*config.regular_due_date_range))
         orders[oid] = OrderData(
             order_id=oid, product_id=p, quantity=qty,
-            due_date=due,
+            due_date=due, weight=float(qty),
         )
         oid += 1
 
