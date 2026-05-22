@@ -454,3 +454,98 @@ def log_hetero_graph_to_tensorboard(writer, env, ep: int):
     fig = draw_hetero_graph(env, ep)
     writer.add_figure("graph/hetero_state", fig, global_step=ep)
     plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────
+# 간트 차트
+# ─────────────────────────────────────────────────────────
+
+def draw_gantt(env, title: str = "Schedule", save_path: str = None):
+    """
+    에피소드 종료 후 env에서 스케줄을 읽어 간트 차트를 그린다.
+
+    Parameters
+    ----------
+    env       : 에피소드가 끝난 FFSASchedulingEnv
+    title     : 차트 제목
+    save_path : 지정하면 PNG 저장, None이면 plt.show()
+    """
+    kfont = _init_font()
+
+    # ── 기계 목록 및 색상 ──
+    num_machines = env.instance.num_machines
+    product_ids  = sorted(env.instance.products.keys())
+    cmap         = plt.get_cmap("tab10")
+    prod_color   = {p: cmap(i % 10) for i, p in enumerate(product_ids)}
+
+    fig, ax = plt.subplots(figsize=(14, max(4, num_machines * 0.55)))
+
+    # ── 각 operation 막대 그리기 ──
+    for op in env.operations.values():
+        if not op.is_done:
+            continue
+        if op.start_time is None or op.completion_time is None:
+            continue
+        if op.machine_id is None:
+            continue
+
+        job       = env.instance.jobs[op.job_id]
+        order     = env.instance.orders[job.order_id]
+        color     = prod_color[job.product_id]
+        duration  = op.completion_time - op.start_time
+        y         = op.machine_id
+
+        ax.barh(
+            y, duration, left=op.start_time,
+            color=color, edgecolor="white", linewidth=0.5, alpha=0.85,
+        )
+        # 납기 초과 여부 표시 (빨간 테두리)
+        if op.is_assembly or job.is_final_job:
+            if op.completion_time > order.due_date + 1e-6:
+                ax.barh(
+                    y, duration, left=op.start_time,
+                    color="none", edgecolor="red", linewidth=1.5,
+                )
+
+    # ── 납기 수직선 ──
+    for order in env.instance.orders.values():
+        ax.axvline(order.due_date, color="red", linewidth=0.7,
+                   linestyle="--", alpha=0.5)
+
+    # ── 기계 y축 레이블 ──
+    ax.set_yticks(range(num_machines))
+    ax.set_yticklabels(
+        [f"M{mid}  (Stage {env.instance.machines[mid].stage_id})"
+         for mid in range(num_machines)],
+        fontproperties=kfont, fontsize=8,
+    )
+    ax.invert_yaxis()
+
+    # ── 범례 ──
+    patches = [
+        mpatches.Patch(color=prod_color[p], label=f"Product {p}")
+        for p in product_ids
+    ]
+    patches.append(mpatches.Patch(color="none", edgecolor="red",
+                                  linewidth=1.5, label="납기 초과"))
+    ax.legend(handles=patches, loc="upper right",
+              prop=kfont if kfont else {}, fontsize=8)
+
+    # ── 통계 출력 ──
+    wt = env.get_actual_weighted_tardiness()
+    ms = env.get_makespan()
+    ax.set_xlabel(f"Time   (Makespan={ms:.1f},  Weighted Tardiness={wt:.1f})",
+                  fontproperties=kfont, fontsize=9)
+    ax.set_title(title, fontproperties=kfont, fontsize=11)
+    ax.grid(axis="x", linestyle=":", alpha=0.4)
+
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"간트 차트 저장: {save_path}")
+        plt.close(fig)
+    else:
+        plt.show()
+
+    return fig
