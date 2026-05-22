@@ -641,7 +641,73 @@ def print_schedule_report(env, title: str = "Schedule Report"):
                 print(f"      {op.stage_id:>5}  {mid:>4}  {st:>8}  {ct:>8}  "
                       f"{dur:>6}  {note}")
 
-    # ── 4. 주문별 납기 요약 ──
+    # ── 4. 기계별 스케줄 테이블 ──
+    print(f"\n{SEP2}")
+    print("[기계별 스케줄 테이블]")
+
+    # 완료된 op만 수집 후 (machine_id, start_time) 순 정렬
+    done_ops = [
+        op for op in env.operations.values()
+        if op.is_done and op.machine_id is not None
+        and op.start_time is not None and op.completion_time is not None
+    ]
+    done_ops.sort(key=lambda o: (o.machine_id, o.start_time))
+
+    cur_machine = None
+    hdr = (f"  {'기계':>4}  {'스테이지':>5}  {'잡ID':>5}  {'주문':>5}  "
+           f"{'제품':>4}  {'종류':>6}  {'시작':>8}  {'종료':>8}  {'처리시간':>6}  {'비고'}")
+    div = (f"  {'-'*4}  {'-'*5}  {'-'*5}  {'-'*5}  "
+           f"{'-'*4}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*6}  {'-'*6}")
+
+    for op in done_ops:
+        if op.machine_id != cur_machine:
+            cur_machine = op.machine_id
+            print(f"\n{hdr}")
+            print(div)
+
+        job   = inst.jobs[op.job_id]
+        order = inst.orders[job.order_id]
+        kind  = "파이널" if job.is_final_job else "컴포넌트"
+        dur   = op.completion_time - op.start_time
+        note  = "조립" if op.is_assembly else ""
+        # 납기 초과 여부 (파이널/조립op 기준)
+        if op.is_assembly or job.is_final_job:
+            if op.completion_time > order.due_date + 1e-6:
+                note += "★지연"
+        print(f"  M{op.machine_id:<3}  {op.stage_id:>5}  {op.job_id:>5}  "
+              f"{job.order_id:>5}  {job.product_id:>4}  {kind:>6}  "
+              f"{op.start_time:>8.1f}  {op.completion_time:>8.1f}  {dur:>6.1f}  {note}")
+
+    # ── 5. 기계 가동률 ──
+    print(f"\n{SEP2}")
+    print("[기계 가동률]")
+    makespan = env.get_makespan()
+    ms_denom = makespan if makespan > 0 else 1.0
+
+    # 스테이지별 가동률 집계용
+    stage_busy: dict = {}
+    stage_count: dict = {}
+
+    print(f"  {'기계':>4}  {'스테이지':>5}  {'처리시간 합':>9}  {'가동률':>6}")
+    print(f"  {'-'*4}  {'-'*5}  {'-'*9}  {'-'*6}")
+    for mid in sorted(inst.machines.keys()):
+        m_ops   = [op for op in done_ops if op.machine_id == mid]
+        busy    = sum(op.completion_time - op.start_time for op in m_ops)
+        util    = busy / ms_denom * 100
+        stage   = inst.machines[mid].stage_id
+        stage_busy[stage]  = stage_busy.get(stage, 0.0) + busy
+        stage_count[stage] = stage_count.get(stage, 0) + 1
+        print(f"  M{mid:<3}  {stage:>5}  {busy:>9.1f}  {util:>5.1f}%")
+
+    print(f"\n  [스테이지 평균 가동률]")
+    print(f"  {'스테이지':>5}  {'기계 수':>5}  {'평균 가동률':>8}")
+    print(f"  {'-'*5}  {'-'*5}  {'-'*8}")
+    for sid in sorted(stage_busy.keys()):
+        n       = stage_count[sid]
+        avg_util = (stage_busy[sid] / n) / ms_denom * 100
+        print(f"  {sid:>5}  {n:>5}  {avg_util:>7.1f}%")
+
+    # ── 6. 주문별 납기 요약 ──
     print(f"\n{SEP2}")
     print("[납기 준수 요약]")
     print(f"  {'주문ID':>5}  {'납기':>8}  {'최종완료':>8}  {'지연':>8}  {'가중 지연':>9}")
@@ -652,7 +718,6 @@ def print_schedule_report(env, title: str = "Schedule Report"):
         prod   = inst.products[order.product_id]
         weight = prod.weight
 
-        # 해당 주문의 모든 잡 완료 시각 중 최대 (최종 완료 시각)
         completion_times = []
         for job_id in list(order.component_job_ids) + list(order.final_job_ids):
             for op_id in env.job_ops.get(job_id, []):
@@ -672,8 +737,8 @@ def print_schedule_report(env, title: str = "Schedule Report"):
         print(f"  {order.order_id:>5}  {order.due_date:>8.1f}  {comp_time:>8.1f}  "
               f"{tardiness:>8.1f}  {wt:>9.2f}{flag}")
 
-    print(f"\n  합계 가중 지연 (WT) : {total_wt:.4f}")
+    print(f"\n  합계 가중 지연 (WT)  : {total_wt:.4f}")
     wt_actual = env.get_actual_weighted_tardiness()
-    print(f"  env.get_actual_WT() : {wt_actual:.4f}")
-    print(f"  메이크스팬          : {env.get_makespan():.1f}")
+    print(f"  env.get_actual_WT()  : {wt_actual:.4f}")
+    print(f"  메이크스팬           : {makespan:.1f}")
     print(SEP)
