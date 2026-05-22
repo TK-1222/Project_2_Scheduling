@@ -26,9 +26,8 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from ffsa_instance import InstanceConfig, full_config
+from ffsa_instance import InstanceConfig, full_config, OpFeat
 from ffsa_env_dispatch import FFSASchedulingEnv
-from ffsa_env import OpFeat
 from ffsa_model import RegularQNetwork, AssemblyQNetwork, DualDQNAgent, ReplayBuffer, _is_assembly
 from ffsa_viz import log_hetero_graph_to_tensorboard
 

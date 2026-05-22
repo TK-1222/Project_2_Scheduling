@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch_geometric.data import Batch as PyGBatch
 from torch_geometric.nn import GATConv
 
-from ffsa_env import OpFeat
+from ffsa_instance import OpFeat
 
 RegularAction = Tuple[int, int]
 AssemblyAction = Tuple[Tuple[int, ...], int]

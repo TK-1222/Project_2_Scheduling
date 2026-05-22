@@ -24,8 +24,8 @@ from torch_geometric.data import HeteroData
 from ffsa_instance import (
     InstanceConfig, FFSAInstance, generate_instance,
     OrderData, ProductData, JobData, MachineData,
+    OpFeat,
 )
-from ffsa_env import OpFeat
 
 # Action 타입 정의
 RegularAction = Tuple[int, int]                    # (op_id, machine_id)

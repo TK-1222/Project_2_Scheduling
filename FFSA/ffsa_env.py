@@ -23,20 +23,8 @@ from torch_geometric.data import HeteroData
 from ffsa_instance import (
     InstanceConfig, FFSAInstance, generate_instance,
     OrderData, ProductData, JobData, MachineData,
+    OpFeat,
 )
-
-# Op 노드 피처 인덱스 — 이 enum이 op_x 텐서의 유일한 스키마 정의
-class OpFeat(IntEnum):
-    IS_DONE        = 0
-    IS_READY       = 1
-    IS_PROCESSING  = 2
-    IS_ASSEMBLY    = 3
-    BUFFER_WAITING = 4
-    STAGE_NORM     = 5
-    PRODUCT_NORM   = 6
-    DUE_DATE_NORM  = 7
-    WEIGHT_NORM    = 8
-    DIM            = 9
 
 
 # Action 타입 정의
