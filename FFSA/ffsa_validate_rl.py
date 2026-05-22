@@ -4,14 +4,16 @@ RL 에이전트 검증 스크립트
 best_model.pt를 로드해 50회 반복 실험.
 결과: 각 에피소드 WT + 평균, 표준편차 출력 (그래프용 값)
 
---gantt 옵션 사용 시 첫 번째 에피소드 스케줄을 간트 차트로 저장.
+--gantt  : 첫 번째 에피소드 간트 차트를 PNG로 저장  (runs/<exp>/gantt_rl_seed<N>.png)
+--report : 첫 번째 에피소드 스케줄 리포트를 TXT로 저장 (runs/<exp>/schedule_report_seed<N>.txt)
 
 사용법:
   python ffsa_validate_rl.py --checkpoint runs/exp_name/checkpoints/best_model.pt
-  python ffsa_validate_rl.py --checkpoint runs/exp_name/checkpoints/best_model.pt --gantt
+  python ffsa_validate_rl.py --checkpoint runs/exp_name/checkpoints/best_model.pt --report --gantt
 """
 
 import argparse
+import os
 import numpy as np
 import torch
 
@@ -35,8 +37,12 @@ def main():
     parser.add_argument("--gantt",       action="store_true",
                         help="첫 번째 에피소드 간트 차트를 PNG로 저장")
     parser.add_argument("--report",      action="store_true",
-                        help="첫 번째 에피소드 스케줄 리포트를 텍스트로 출력")
+                        help="첫 번째 에피소드 스케줄 리포트를 TXT 파일로 저장")
     args = parser.parse_args()
+
+    # 체크포인트 경로에서 runs/<exp_name> 디렉터리를 추출
+    # 예: runs/exp1/checkpoints/best_model.pt → runs/exp1
+    run_dir = os.path.dirname(os.path.dirname(args.checkpoint))
 
     # ── 모델 로드 ──
     ckpt = torch.load(args.checkpoint, map_location=args.device)
@@ -80,11 +86,14 @@ def main():
                 from ffsa_viz import draw_gantt
                 draw_gantt(env,
                            title=f"RL Agent  (seed={seed}, WT={wt:.1f})",
-                           save_path=f"gantt_rl_seed{seed}.png")
+                           save_path=os.path.join(run_dir, f"gantt_rl_seed{seed}.png"))
             if args.report:
                 from ffsa_viz import print_schedule_report
-                print_schedule_report(env,
-                                      title=f"RL Agent  (seed={seed}, WT={wt:.1f})")
+                print_schedule_report(
+                    env,
+                    title=f"RL Agent  (seed={seed}, WT={wt:.1f})",
+                    save_path=os.path.join(run_dir, f"schedule_report_seed{seed}.txt"),
+                )
 
     arr = np.array(wt_list)
     print(f"\n{'='*40}")
