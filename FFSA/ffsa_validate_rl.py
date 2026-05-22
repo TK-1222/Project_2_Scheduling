@@ -34,6 +34,8 @@ def main():
     parser.add_argument("--device",      type=str, default="cpu")
     parser.add_argument("--gantt",       action="store_true",
                         help="첫 번째 에피소드 간트 차트를 PNG로 저장")
+    parser.add_argument("--report",      action="store_true",
+                        help="첫 번째 에피소드 스케줄 리포트를 텍스트로 출력")
     args = parser.parse_args()
 
     # ── 모델 로드 ──
@@ -73,12 +75,16 @@ def main():
         wt_list.append(wt)
         print(f"  [{i+1:2d}/50]  seed={seed}  WT={wt:.4f}")
 
-        # 첫 번째 에피소드 간트 차트 저장
-        if i == 0 and args.gantt:
-            from ffsa_viz import draw_gantt
-            draw_gantt(env,
-                       title=f"RL Agent  (seed={seed}, WT={wt:.1f})",
-                       save_path=f"gantt_rl_seed{seed}.png")
+        if i == 0:
+            if args.gantt:
+                from ffsa_viz import draw_gantt
+                draw_gantt(env,
+                           title=f"RL Agent  (seed={seed}, WT={wt:.1f})",
+                           save_path=f"gantt_rl_seed{seed}.png")
+            if args.report:
+                from ffsa_viz import print_schedule_report
+                print_schedule_report(env,
+                                      title=f"RL Agent  (seed={seed}, WT={wt:.1f})")
 
     arr = np.array(wt_list)
     print(f"\n{'='*40}")

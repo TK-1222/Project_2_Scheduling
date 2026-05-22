@@ -549,3 +549,131 @@ def draw_gantt(env, title: str = "Schedule", save_path: str = None):
         plt.show()
 
     return fig
+
+
+# ─────────────────────────────────────────────────────────
+# 텍스트 스케줄 리포트
+# ─────────────────────────────────────────────────────────
+
+def print_schedule_report(env, title: str = "Schedule Report"):
+    """
+    에피소드 종료 후 env에서 스케줄 정보를 텍스트로 출력한다.
+
+    출력 내용:
+      1. 인스턴스 구성 요약 (제품 수, 스테이지 수, 기계 수 등)
+      2. 주문별 구성 (제품, 수량, 납기, 가중치)
+      3. 잡별 처리 경로/기계/시간 상세
+      4. 주문별 납기 준수 요약
+    """
+    inst = env.instance
+    SEP  = "=" * 70
+    SEP2 = "-" * 70
+
+    print(f"\n{SEP}")
+    print(f"  {title}")
+    print(SEP)
+
+    # ── 1. 인스턴스 구성 요약 ──
+    print("\n[인스턴스 구성]")
+    print(f"  제품 수       : {inst.num_products}")
+    print(f"  스테이지 수   : {inst.num_stages}")
+    print(f"  기계 수       : {inst.num_machines}")
+    print(f"  주문 수       : {len(inst.orders)}")
+    print(f"  잡 수         : {len(inst.jobs)}")
+
+    # 스테이지별 기계 목록
+    stage_machine_map: dict = {}
+    for m in inst.machines.values():
+        stage_machine_map.setdefault(m.stage_id, []).append(m.machine_id)
+    print(f"\n  스테이지별 기계:")
+    for sid in sorted(stage_machine_map):
+        mids = sorted(stage_machine_map[sid])
+        print(f"    Stage {sid}: M{mids}")
+
+    # ── 2. 주문 구성 ──
+    print(f"\n{SEP2}")
+    print("[주문 구성]")
+    print(f"  {'주문ID':>5}  {'제품ID':>5}  {'수량':>4}  {'납기':>8}  {'가중치':>6}")
+    print(f"  {'-'*5}  {'-'*5}  {'-'*4}  {'-'*8}  {'-'*6}")
+    for order in sorted(inst.orders.values(), key=lambda o: o.order_id):
+        prod   = inst.products[order.product_id]
+        weight = prod.weight
+        print(f"  {order.order_id:>5}  {order.product_id:>5}  {order.quantity:>4}  "
+              f"{order.due_date:>8.1f}  {weight:>6.2f}")
+
+    # ── 3. 잡별 처리 상세 ──
+    print(f"\n{SEP2}")
+    print("[잡별 처리 상세]")
+
+    for order in sorted(inst.orders.values(), key=lambda o: o.order_id):
+        print(f"\n  ▶ 주문 {order.order_id}  (제품 {order.product_id}, "
+              f"납기={order.due_date:.1f}, 수량={order.quantity})")
+
+        all_job_ids = list(order.component_job_ids) + list(order.final_job_ids)
+        for job_id in all_job_ids:
+            job  = inst.jobs[job_id]
+            kind = "컴포넌트" if job.is_component else "파이널  "
+            print(f"\n    잡 {job_id:>3}  [{kind}]  "
+                  f"route={list(job.route)}  "
+                  f"assembly_stage={job.assembly_stage}")
+
+            op_ids = env.job_ops.get(job_id, [])
+            if not op_ids:
+                print("      (운영 없음)")
+                continue
+
+            print(f"      {'스테이지':>5}  {'기계':>4}  {'시작':>8}  {'종료':>8}  "
+                  f"{'처리시간':>6}  {'비고':}")
+            print(f"      {'-'*5}  {'-'*4}  {'-'*8}  {'-'*8}  {'-'*6}  {'-'*10}")
+            for op_id in op_ids:
+                op = env.operations[op_id]
+                st = f"{op.start_time:.1f}"      if op.start_time      is not None else "  -"
+                ct = f"{op.completion_time:.1f}" if op.completion_time is not None else "  -"
+                mid = f"M{op.machine_id}"        if op.machine_id      is not None else " -"
+                dur = (f"{op.completion_time - op.start_time:.1f}"
+                       if (op.start_time is not None and op.completion_time is not None)
+                       else " -")
+                note = ""
+                if op.is_assembly:
+                    note = "조립op"
+                elif not op.is_done:
+                    note = "미완료"
+                print(f"      {op.stage_id:>5}  {mid:>4}  {st:>8}  {ct:>8}  "
+                      f"{dur:>6}  {note}")
+
+    # ── 4. 주문별 납기 요약 ──
+    print(f"\n{SEP2}")
+    print("[납기 준수 요약]")
+    print(f"  {'주문ID':>5}  {'납기':>8}  {'최종완료':>8}  {'지연':>8}  {'가중 지연':>9}")
+    print(f"  {'-'*5}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*9}")
+
+    total_wt = 0.0
+    for order in sorted(inst.orders.values(), key=lambda o: o.order_id):
+        prod   = inst.products[order.product_id]
+        weight = prod.weight
+
+        # 해당 주문의 모든 잡 완료 시각 중 최대 (최종 완료 시각)
+        completion_times = []
+        for job_id in list(order.component_job_ids) + list(order.final_job_ids):
+            for op_id in env.job_ops.get(job_id, []):
+                op = env.operations[op_id]
+                if op.is_done and op.completion_time is not None:
+                    completion_times.append(op.completion_time)
+
+        if not completion_times:
+            print(f"  {order.order_id:>5}  {order.due_date:>8.1f}  {'미완':>8}  {'-':>8}  {'?':>9}")
+            continue
+
+        comp_time  = max(completion_times)
+        tardiness  = max(0.0, comp_time - order.due_date)
+        wt         = weight * tardiness
+        total_wt  += wt
+        flag       = "  <<지연>>" if tardiness > 0 else ""
+        print(f"  {order.order_id:>5}  {order.due_date:>8.1f}  {comp_time:>8.1f}  "
+              f"{tardiness:>8.1f}  {wt:>9.2f}{flag}")
+
+    print(f"\n  합계 가중 지연 (WT) : {total_wt:.4f}")
+    wt_actual = env.get_actual_weighted_tardiness()
+    print(f"  env.get_actual_WT() : {wt_actual:.4f}")
+    print(f"  메이크스팬          : {env.get_makespan():.1f}")
+    print(SEP)
