@@ -17,10 +17,9 @@ import os
 import numpy as np
 import torch
 
-from ffsa_instance import full_config
+from ffsa_instance import full_config, OpFeat
 from ffsa_env_dispatch import FFSASchedulingEnv
 from ffsa_model import RegularQNetwork, AssemblyQNetwork, DualDQNAgent
-from ffsa_env import OpFeat
 
 # ── 두 스크립트 공통 시드 (dispatching rule 비교와 동일 인스턴스 사용) ──
 TEST_SEEDS = list(range(10000, 10050))   # 50개
