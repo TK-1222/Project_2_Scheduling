@@ -724,7 +724,7 @@ class FFSASchedulingEnv(gym.Env):
             op for op in self.operations.values()
             if op.active and op.is_ready and not op.is_processing and not op.is_assembly
         ]
-        ready.sort(key=lambda op: self.instance.jobs[op.job_id].arrival_time)
+        ready.sort(key=lambda op: self.instance.jobs[op.job_id].job_id)
         for op in ready:
             mid = self._best_machine_for_op(op)
             if mid is not None:

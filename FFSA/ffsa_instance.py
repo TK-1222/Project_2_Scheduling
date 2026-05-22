@@ -38,7 +38,7 @@ class InstanceConfig:
     # 정규주문 (t=0 도착)
     num_regular_orders: int = 6
     regular_quantity_range: Tuple[int, int] = (1, 3)
-    regular_due_date_range: Tuple[float, float] = (300.0, 900.0)
+    regular_due_date_range: Tuple[float, float] = (250.0, 500.0)
 
 
 # ──────────────────────────────────────────────────────────

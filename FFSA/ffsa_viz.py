@@ -600,8 +600,7 @@ def print_schedule_report(env, title: str = "Schedule Report",
     w(f"  {'주문ID':>5}  {'제품ID':>5}  {'수량':>4}  {'납기':>8}  {'가중치':>6}")
     w(f"  {'-'*5}  {'-'*5}  {'-'*4}  {'-'*8}  {'-'*6}")
     for order in sorted(inst.orders.values(), key=lambda o: o.order_id):
-        prod   = inst.products[order.product_id]
-        weight = prod.weight
+        weight = order.weight
         w(f"  {order.order_id:>5}  {order.product_id:>5}  {order.quantity:>4}  "
           f"{order.due_date:>8.1f}  {weight:>6.2f}")
 
@@ -709,8 +708,7 @@ def print_schedule_report(env, title: str = "Schedule Report",
 
     total_wt = 0.0
     for order in sorted(inst.orders.values(), key=lambda o: o.order_id):
-        prod   = inst.products[order.product_id]
-        weight = prod.weight
+        weight = order.weight
 
         completion_times = []
         for job_id in list(order.component_job_ids) + list(order.final_job_ids):
