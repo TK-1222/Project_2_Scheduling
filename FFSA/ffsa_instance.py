@@ -152,9 +152,10 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
         qty = int(rng.randint(config.regular_quantity_range[0],
                                config.regular_quantity_range[1] + 1))
         due = float(rng.uniform(*config.regular_due_date_range))
+        _weight_map = {1: 1.0, 2: 1.25, 3: 1.75}
         orders[oid] = OrderData(
             order_id=oid, product_id=p, quantity=qty,
-            due_date=due, weight=float(qty),
+            due_date=due, weight=_weight_map.get(qty, float(qty)),
         )
         oid += 1
 
