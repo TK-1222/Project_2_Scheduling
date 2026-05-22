@@ -142,7 +142,6 @@ def train(
     print(f"  제품 수: {config.num_products}")
     print(f"  Stage 수: {config.num_stages}")
     print(f"  정규주문: {config.num_regular_orders}건")
-    print(f"  긴급주문: {config.num_urgent_orders}건")
     print(f"  Assembly: {config.use_assembly}")
     print(f"  Setup: {config.use_setup}")
     print(f"  유한 버퍼: {config.use_finite_buffer}")

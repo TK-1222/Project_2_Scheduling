@@ -3,7 +3,6 @@ FFSA 인스턴스 생성기
 =====================
 주문 모델:
   - 정규주문: t=0 도착, 제품 종류·수량·납기 지정
-  - 긴급주문: t>0 랜덤 도착, 짧은 납기
   - 주문 내 unit들은 납기 공유
   - Job = 조립 전 구성품 하나 (에이전트가 개별 의사결정)
 """
@@ -25,11 +24,10 @@ class InstanceConfig:
     num_stages: int = 6
     assembly_stage_idx: int = 3
     machines_per_stage: Optional[List[int]] = field(default_factory=lambda: [3, 3, 3, 3, 3, 3])
-    processing_time_range: Tuple[float, float] = (10.0, 60.0)
-    setup_time_range: Tuple[float, float] = (10.0, 30.0)
-    assembly_setup_time_range: Tuple[float, float] = (30.0, 80.0)
+    processing_time_range: Tuple[float, float] = (30.0, 40.0)
+    setup_time_range: Tuple[float, float] = (6.0, 12.0)
+    assembly_setup_time_range: Tuple[float, float] = (30.0, 30.0)
     buffer_capacity: int = 10
-    weight_range: Tuple[float, float] = (1.0, 5.0)
     machine_stage_prob: float = 0.7    # 기계가 스테이지 처리 가능한 확률
     component_stage_prob: float = 0.7  # 컴포넌트별 스테이지 방문 확률
     final_stage_prob: float = 0.7      # final job 스테이지 방문 확률
@@ -40,12 +38,7 @@ class InstanceConfig:
     # 정규주문 (t=0 도착)
     num_regular_orders: int = 6
     regular_quantity_range: Tuple[int, int] = (1, 3)
-    regular_due_date_range: Tuple[float, float] = (300.0, 900.0)
-    # 긴급주문 (포아송 프로세스, 실시간 생성)
-    num_urgent_orders: int = 2                              # 에피소드당 최대 긴급주문 수
-    urgent_inter_arrival_mean: float = 150.0               # 평균 도착 간격 (1/λ)
-    urgent_quantity_range: Tuple[int, int] = (1, 2)
-    urgent_due_date_offset_range: Tuple[float, float] = (80.0, 160.0)  # arrival + offset
+    regular_due_date_range: Tuple[float, float] = (250.0, 500.0)
 
 
 # ──────────────────────────────────────────────────────────
@@ -54,13 +47,12 @@ class InstanceConfig:
 
 @dataclass
 class OrderData:
-    """주문 정보: 어떤 제품을 몇 개, 언제까지, 언제 도착"""
+    """주문 정보: 어떤 제품을 몇 개, 언제까지"""
     order_id: int
     product_id: int
     quantity: int
     due_date: float
-    arrival_time: float        # 0 = 정규주문, >0 = 긴급주문
-    is_urgent: bool = False
+    weight: float = 1.0          # 수량과 동일 (수량이 클수록 납기 지연 페널티 큼)
     component_job_ids: List[int] = field(default_factory=list)
     final_job_ids: List[int] = field(default_factory=list)
 
@@ -69,7 +61,6 @@ class OrderData:
 class ProductData:
     """제품 정보"""
     product_id: int
-    weight: float              # wp (tardiness 가중치)
     num_components: int = 2    # 조립에 필요한 컴포넌트 수 (제품마다 다름)
 
 
@@ -79,7 +70,6 @@ class JobData:
     job_id: int
     product_id: int
     order_id: int
-    arrival_time: float        # 주문 도착 시점 상속
     route: List[int] = field(default_factory=list)
     is_component: bool = False
     component_type_idx: int = 0
@@ -150,7 +140,6 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
         )
         products[p] = ProductData(
             product_id=p,
-            weight=float(rng.uniform(*config.weight_range)),
             num_components=num_comp,
         )
 
@@ -163,13 +152,12 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
         qty = int(rng.randint(config.regular_quantity_range[0],
                                config.regular_quantity_range[1] + 1))
         due = float(rng.uniform(*config.regular_due_date_range))
+        _weight_map = {1: 1.0, 2: 1.25, 3: 1.75}
         orders[oid] = OrderData(
             order_id=oid, product_id=p, quantity=qty,
-            due_date=due, arrival_time=0.0, is_urgent=False,
+            due_date=due, weight=_weight_map.get(qty, float(qty)),
         )
         oid += 1
-
-    # 긴급주문은 에피소드 진행 중 환경에서 실시간 생성 (포아송 프로세스)
 
     # ── 기계 호환성 생성 ──
     # 컴포넌트 job 호환성: (product_id, component_type_idx) 조합
@@ -242,7 +230,6 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
                         job_id=jid,
                         product_id=order.product_id,
                         order_id=order.order_id,
-                        arrival_time=order.arrival_time,
                         route=list(route),
                         is_component=True,
                         component_type_idx=comp_type,
@@ -257,7 +244,6 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
                     job_id=jid,
                     product_id=order.product_id,
                     order_id=order.order_id,
-                    arrival_time=order.arrival_time,
                     route=list(route),
                     is_final_job=True,
                     assembly_stage=config.assembly_stage_idx,
@@ -275,7 +261,6 @@ def generate_instance(config: InstanceConfig) -> FFSAInstance:
                     job_id=jid,
                     product_id=order.product_id,
                     order_id=order.order_id,
-                    arrival_time=order.arrival_time,
                     route=list(route),
                     is_final_job=False,
                     order_unit_idx=unit_idx,

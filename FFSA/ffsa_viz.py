@@ -454,3 +454,293 @@ def log_hetero_graph_to_tensorboard(writer, env, ep: int):
     fig = draw_hetero_graph(env, ep)
     writer.add_figure("graph/hetero_state", fig, global_step=ep)
     plt.close(fig)
+
+
+# ─────────────────────────────────────────────────────────
+# 간트 차트
+# ─────────────────────────────────────────────────────────
+
+def draw_gantt(env, title: str = "Schedule", save_path: str = None):
+    """
+    에피소드 종료 후 env에서 스케줄을 읽어 간트 차트를 그린다.
+
+    Parameters
+    ----------
+    env       : 에피소드가 끝난 FFSASchedulingEnv
+    title     : 차트 제목
+    save_path : 지정하면 PNG 저장, None이면 plt.show()
+    """
+    kfont = _init_font()
+
+    # ── 기계 목록 및 색상 ──
+    num_machines = env.instance.num_machines
+    product_ids  = sorted(env.instance.products.keys())
+    cmap         = plt.get_cmap("tab10")
+    prod_color   = {p: cmap(i % 10) for i, p in enumerate(product_ids)}
+
+    fig, ax = plt.subplots(figsize=(14, max(4, num_machines * 0.55)))
+
+    # ── 각 operation 막대 그리기 ──
+    for op in env.operations.values():
+        if not op.is_done:
+            continue
+        if op.start_time is None or op.completion_time is None:
+            continue
+        if op.machine_id is None:
+            continue
+
+        job       = env.instance.jobs[op.job_id]
+        order     = env.instance.orders[job.order_id]
+        color     = prod_color[job.product_id]
+        duration  = op.completion_time - op.start_time
+        y         = op.machine_id
+
+        ax.barh(
+            y, duration, left=op.start_time,
+            color=color, edgecolor="white", linewidth=0.5, alpha=0.85,
+        )
+        # 납기 초과 여부 표시 (빨간 테두리)
+        if op.is_assembly or job.is_final_job:
+            if op.completion_time > order.due_date + 1e-6:
+                ax.barh(
+                    y, duration, left=op.start_time,
+                    color="none", edgecolor="red", linewidth=1.5,
+                )
+
+    # ── 납기 수직선 ──
+    for order in env.instance.orders.values():
+        ax.axvline(order.due_date, color="red", linewidth=0.7,
+                   linestyle="--", alpha=0.5)
+
+    # ── 기계 y축 레이블 ──
+    ax.set_yticks(range(num_machines))
+    ax.set_yticklabels(
+        [f"M{mid}  (Stage {env.instance.machines[mid].stage_id})"
+         for mid in range(num_machines)],
+        fontproperties=kfont, fontsize=8,
+    )
+    ax.invert_yaxis()
+
+    # ── 범례 ──
+    patches = [
+        mpatches.Patch(color=prod_color[p], label=f"Product {p}")
+        for p in product_ids
+    ]
+    patches.append(mpatches.Patch(color="none", edgecolor="red",
+                                  linewidth=1.5, label="납기 초과"))
+    ax.legend(handles=patches, loc="upper right",
+              prop=kfont if kfont else {}, fontsize=8)
+
+    # ── 통계 출력 ──
+    wt = env.get_actual_weighted_tardiness()
+    ms = env.get_makespan()
+    ax.set_xlabel(f"Time   (Makespan={ms:.1f},  Weighted Tardiness={wt:.1f})",
+                  fontproperties=kfont, fontsize=9)
+    ax.set_title(title, fontproperties=kfont, fontsize=11)
+    ax.grid(axis="x", linestyle=":", alpha=0.4)
+
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"간트 차트 저장: {save_path}")
+        plt.close(fig)
+    else:
+        plt.show()
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────
+# 텍스트 스케줄 리포트
+# ─────────────────────────────────────────────────────────
+
+def print_schedule_report(env, title: str = "Schedule Report",
+                          save_path: str = None):
+    """
+    에피소드 종료 후 env에서 스케줄 정보를 텍스트 파일로 저장한다.
+
+    Parameters
+    ----------
+    env       : 에피소드가 끝난 FFSASchedulingEnv
+    title     : 리포트 제목
+    save_path : 저장할 파일 경로. None이면 stdout으로 출력.
+    """
+    import io, os, sys
+
+    inst = env.instance
+    SEP  = "=" * 70
+    SEP2 = "-" * 70
+    lines = []
+    w = lines.append   # 한 줄씩 추가하는 단축 함수
+
+    w(f"\n{SEP}")
+    w(f"  {title}")
+    w(SEP)
+
+    # ── 1. 인스턴스 구성 요약 ──
+    w("\n[인스턴스 구성]")
+    w(f"  제품 수       : {inst.num_products}")
+    w(f"  스테이지 수   : {inst.num_stages}")
+    w(f"  기계 수       : {inst.num_machines}")
+    w(f"  주문 수       : {len(inst.orders)}")
+    w(f"  잡 수         : {len(inst.jobs)}")
+
+    stage_machine_map: dict = {}
+    for m in inst.machines.values():
+        stage_machine_map.setdefault(m.stage_id, []).append(m.machine_id)
+    w(f"\n  스테이지별 기계:")
+    for sid in sorted(stage_machine_map):
+        mids = sorted(stage_machine_map[sid])
+        w(f"    Stage {sid}: M{mids}")
+
+    # ── 2. 주문 구성 ──
+    w(f"\n{SEP2}")
+    w("[주문 구성]")
+    w(f"  {'주문ID':>5}  {'제품ID':>5}  {'수량':>4}  {'납기':>8}  {'가중치':>6}")
+    w(f"  {'-'*5}  {'-'*5}  {'-'*4}  {'-'*8}  {'-'*6}")
+    for order in sorted(inst.orders.values(), key=lambda o: o.order_id):
+        weight = order.weight
+        w(f"  {order.order_id:>5}  {order.product_id:>5}  {order.quantity:>4}  "
+          f"{order.due_date:>8.1f}  {weight:>6.2f}")
+
+    # ── 3. 잡별 처리 상세 ──
+    w(f"\n{SEP2}")
+    w("[잡별 처리 상세]")
+
+    for order in sorted(inst.orders.values(), key=lambda o: o.order_id):
+        w(f"\n  ▶ 주문 {order.order_id}  (제품 {order.product_id}, "
+          f"납기={order.due_date:.1f}, 수량={order.quantity})")
+
+        all_job_ids = list(order.component_job_ids) + list(order.final_job_ids)
+        for job_id in all_job_ids:
+            job  = inst.jobs[job_id]
+            kind = "컴포넌트" if job.is_component else "파이널  "
+            w(f"\n    잡 {job_id:>3}  [{kind}]  "
+              f"route={list(job.route)}  assembly_stage={job.assembly_stage}")
+
+            op_ids = env.job_ops.get(job_id, [])
+            if not op_ids:
+                w("      (운영 없음)")
+                continue
+
+            w(f"      {'스테이지':>5}  {'기계':>4}  {'시작':>8}  {'종료':>8}  "
+              f"{'처리시간':>6}  {'비고'}")
+            w(f"      {'-'*5}  {'-'*4}  {'-'*8}  {'-'*8}  {'-'*6}  {'-'*10}")
+            for op_id in op_ids:
+                op  = env.operations[op_id]
+                st  = f"{op.start_time:.1f}"      if op.start_time      is not None else "-"
+                ct  = f"{op.completion_time:.1f}" if op.completion_time is not None else "-"
+                mid = f"M{op.machine_id}"         if op.machine_id      is not None else "-"
+                dur = (f"{op.completion_time - op.start_time:.1f}"
+                       if (op.start_time is not None and op.completion_time is not None)
+                       else "-")
+                note = "조립op" if op.is_assembly else ("미완료" if not op.is_done else "")
+                w(f"      {op.stage_id:>5}  {mid:>4}  {st:>8}  {ct:>8}  {dur:>6}  {note}")
+
+    # ── 4. 기계별 스케줄 테이블 ──
+    w(f"\n{SEP2}")
+    w("[기계별 스케줄 테이블]")
+
+    done_ops = [
+        op for op in env.operations.values()
+        if op.is_done and op.machine_id is not None
+        and op.start_time is not None and op.completion_time is not None
+    ]
+    done_ops.sort(key=lambda o: (o.machine_id, o.start_time))
+
+    cur_machine = None
+    hdr = (f"  {'기계':>4}  {'스테이지':>5}  {'잡ID':>5}  {'주문':>5}  "
+           f"{'제품':>4}  {'종류':>6}  {'시작':>8}  {'종료':>8}  {'처리시간':>6}  {'비고'}")
+    div = (f"  {'-'*4}  {'-'*5}  {'-'*5}  {'-'*5}  "
+           f"{'-'*4}  {'-'*6}  {'-'*8}  {'-'*8}  {'-'*6}  {'-'*6}")
+
+    for op in done_ops:
+        if op.machine_id != cur_machine:
+            cur_machine = op.machine_id
+            w(f"\n{hdr}")
+            w(div)
+
+        job   = inst.jobs[op.job_id]
+        order = inst.orders[job.order_id]
+        kind  = "파이널" if job.is_final_job else "컴포넌트"
+        dur   = op.completion_time - op.start_time
+        note  = "조립" if op.is_assembly else ""
+        if (op.is_assembly or job.is_final_job) and op.completion_time > order.due_date + 1e-6:
+            note += "★지연"
+        w(f"  M{op.machine_id:<3}  {op.stage_id:>5}  {op.job_id:>5}  "
+          f"{job.order_id:>5}  {job.product_id:>4}  {kind:>6}  "
+          f"{op.start_time:>8.1f}  {op.completion_time:>8.1f}  {dur:>6.1f}  {note}")
+
+    # ── 5. 기계 가동률 ──
+    w(f"\n{SEP2}")
+    w("[기계 가동률]")
+    makespan = env.get_makespan()
+    ms_denom = makespan if makespan > 0 else 1.0
+
+    stage_busy: dict = {}
+    stage_count: dict = {}
+
+    w(f"  {'기계':>4}  {'스테이지':>5}  {'처리시간 합':>9}  {'가동률':>6}")
+    w(f"  {'-'*4}  {'-'*5}  {'-'*9}  {'-'*6}")
+    for mid in sorted(inst.machines.keys()):
+        m_ops  = [op for op in done_ops if op.machine_id == mid]
+        busy   = sum(op.completion_time - op.start_time for op in m_ops)
+        util   = busy / ms_denom * 100
+        stage  = inst.machines[mid].stage_id
+        stage_busy[stage]  = stage_busy.get(stage, 0.0) + busy
+        stage_count[stage] = stage_count.get(stage, 0) + 1
+        w(f"  M{mid:<3}  {stage:>5}  {busy:>9.1f}  {util:>5.1f}%")
+
+    w(f"\n  [스테이지 평균 가동률]")
+    w(f"  {'스테이지':>5}  {'기계 수':>5}  {'평균 가동률':>8}")
+    w(f"  {'-'*5}  {'-'*5}  {'-'*8}")
+    for sid in sorted(stage_busy.keys()):
+        n        = stage_count[sid]
+        avg_util = (stage_busy[sid] / n) / ms_denom * 100
+        w(f"  {sid:>5}  {n:>5}  {avg_util:>7.1f}%")
+
+    # ── 6. 주문별 납기 요약 ──
+    w(f"\n{SEP2}")
+    w("[납기 준수 요약]")
+    w(f"  {'주문ID':>5}  {'납기':>8}  {'최종완료':>8}  {'지연':>8}  {'가중 지연':>9}")
+    w(f"  {'-'*5}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*9}")
+
+    total_wt = 0.0
+    for order in sorted(inst.orders.values(), key=lambda o: o.order_id):
+        weight = order.weight
+
+        completion_times = []
+        for job_id in list(order.component_job_ids) + list(order.final_job_ids):
+            for op_id in env.job_ops.get(job_id, []):
+                op = env.operations[op_id]
+                if op.is_done and op.completion_time is not None:
+                    completion_times.append(op.completion_time)
+
+        if not completion_times:
+            w(f"  {order.order_id:>5}  {order.due_date:>8.1f}  {'미완':>8}  {'-':>8}  {'?':>9}")
+            continue
+
+        comp_time = max(completion_times)
+        tardiness = max(0.0, comp_time - order.due_date)
+        wt        = weight * tardiness
+        total_wt += wt
+        flag      = "  <<지연>>" if tardiness > 0 else ""
+        w(f"  {order.order_id:>5}  {order.due_date:>8.1f}  {comp_time:>8.1f}  "
+          f"{tardiness:>8.1f}  {wt:>9.2f}{flag}")
+
+    w(f"\n  합계 가중 지연 (WT)  : {total_wt:.4f}")
+    wt_actual = env.get_actual_weighted_tardiness()
+    w(f"  env.get_actual_WT()  : {wt_actual:.4f}")
+    w(f"  메이크스팬           : {makespan:.1f}")
+    w(SEP)
+
+    # ── 출력 또는 파일 저장 ──
+    text = "\n".join(lines) + "\n"
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True) if os.path.dirname(save_path) else None
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"스케줄 리포트 저장: {save_path}")
+    else:
+        sys.stdout.write(text)
