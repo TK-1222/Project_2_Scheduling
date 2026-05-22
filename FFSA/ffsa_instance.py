@@ -24,9 +24,9 @@ class InstanceConfig:
     num_stages: int = 6
     assembly_stage_idx: int = 3
     machines_per_stage: Optional[List[int]] = field(default_factory=lambda: [3, 3, 3, 3, 3, 3])
-    processing_time_range: Tuple[float, float] = (10.0, 60.0)
-    setup_time_range: Tuple[float, float] = (10.0, 30.0)
-    assembly_setup_time_range: Tuple[float, float] = (30.0, 80.0)
+    processing_time_range: Tuple[float, float] = (30.0, 40.0)
+    setup_time_range: Tuple[float, float] = (6.0, 12.0)
+    assembly_setup_time_range: Tuple[float, float] = (30.0, 30.0)
     buffer_capacity: int = 10
     weight_range: Tuple[float, float] = (1.0, 5.0)
     machine_stage_prob: float = 0.7    # 기계가 스테이지 처리 가능한 확률
