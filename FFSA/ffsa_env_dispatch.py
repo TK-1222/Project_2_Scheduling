@@ -352,7 +352,7 @@ class FFSASchedulingEnv(gym.Env):
             self.buffers[sid] = BufferState(stage_id=sid, capacity=cap)
 
     def _init_assembly_pool(self):
-        """조립 버퍼 pool 및 정규주문 final job 초기화 (긴급주문은 실시간 추가)"""
+        """조립 버퍼 pool 및 정규주문 final job 초기화"""
         self.assembly_pool = {p: {} for p in self.instance.products}
         self.inactive_final_jobs = {p: [] for p in self.instance.products}
         if not self.config.use_assembly:
