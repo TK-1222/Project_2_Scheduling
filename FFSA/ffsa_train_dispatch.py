@@ -219,13 +219,13 @@ def train(
 
             if info.get("deadlock"):
                 ep_deadlock   = True
-                total_reward += -1000.0
-                # 데드락 terminal transition: done=True이므로 target = -1000 (액션 무관)
+                total_reward += -100.0
+                # 데드락 terminal transition: done=True이므로 target = -100 (액션 무관)
                 dl_act = next(
                     (i for i, a in enumerate(obs["actions"]) if not _is_assembly(a)),
                     0
                 )
-                reg_buffer.push(obs, dl_act, -1000.0, obs, True)
+                reg_buffer.push(obs, dl_act, -100.0, obs, True)
                 break
 
             # train_freq 스텝마다 배치 학습 + soft target update

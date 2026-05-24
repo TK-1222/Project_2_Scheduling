@@ -325,13 +325,14 @@ class RegularQNetwork(nn.Module):
         pool_count_norm = min(pool_total / max(len(assembly_pool) * 5, 1), 1.0)
 
         if assembly_pool:
-            ready           = sum(1 for tp in assembly_pool.values() if len(tp) >= 2)
+            ready           = sum(1 for tp in assembly_pool.values()
+                                  if tp and all(len(jobs) >= 1 for jobs in tp.values()))
             pool_ready_rate = ready / len(assembly_pool)
         else:
             pool_ready_rate = 0.0
 
         inactive_counts = [len(v) for v in inactive.values()]
-        inactive_norm   = min(float(np.mean(inactive_counts)) / 5.0, 1.0) if inactive_counts else 0.0
+        inactive_norm   = min(float(np.mean(inactive_counts)) / 15.0, 1.0) if inactive_counts else 0.0
 
         with torch.no_grad():
             if graph_data['op'].x.size(0) > 0:
@@ -360,13 +361,14 @@ class RegularQNetwork(nn.Module):
         pool_count_norm = min(pool_total / max(len(assembly_pool) * 5, 1), 1.0)
 
         if assembly_pool:
-            ready           = sum(1 for tp in assembly_pool.values() if len(tp) >= 2)
+            ready           = sum(1 for tp in assembly_pool.values()
+                                  if tp and all(len(jobs) >= 1 for jobs in tp.values()))
             pool_ready_rate = ready / len(assembly_pool)
         else:
             pool_ready_rate = 0.0
 
         inactive_counts = [len(v) for v in inactive.values()]
-        inactive_norm   = min(float(np.mean(inactive_counts)) / 5.0, 1.0) if inactive_counts else 0.0
+        inactive_norm   = min(float(np.mean(inactive_counts)) / 15.0, 1.0) if inactive_counts else 0.0
 
         gnn_emb = op_h.mean(dim=0) if op_h.size(0) > 0 else torch.zeros(self.hidden_dim, device=device)
         scalar  = torch.tensor([pool_count_norm, pool_ready_rate, inactive_norm],
@@ -534,7 +536,8 @@ class AssemblyQNetwork(nn.Module):
                 )
 
         if assembly_pool:
-            shortage      = sum(1 for tp in assembly_pool.values() if len(tp) < 2)
+            shortage      = sum(1 for tp in assembly_pool.values()
+                                if not tp or not all(len(jobs) >= 1 for jobs in tp.values()))
             shortage_rate = shortage / len(assembly_pool)
         else:
             shortage_rate = 1.0
@@ -578,7 +581,8 @@ class AssemblyQNetwork(nn.Module):
                 )
 
         shortage_rate = (
-            sum(1 for tp in assembly_pool.values() if len(tp) < 2) / len(assembly_pool)
+            sum(1 for tp in assembly_pool.values()
+                if not tp or not all(len(jobs) >= 1 for jobs in tp.values())) / len(assembly_pool)
             if assembly_pool else 1.0
         )
         pressure = (
@@ -802,11 +806,8 @@ class DualDQNAgent:
                 next_asm = [a for a in na if     _is_assembly(a)]
                 with torch.no_grad():
                     nq_reg = (self.reg_target(ng, na, np_, noi, u_p=nu_p).max()
-                              if next_reg else torch.tensor(-1e9, device=self.device))
-                    nq_asm = (self.asm_target(ng, na, np_, noi, njm, c_p=nc_p).max()
-                              if next_asm else torch.tensor(-1e9, device=self.device))
-                next_val = torch.max(nq_reg, nq_asm)
-                target = torch.tensor(float(reward), device=self.device) + self.gamma * next_val
+                              if next_reg else torch.tensor(0.0, device=self.device))
+                target = torch.tensor(float(reward), device=self.device) + self.gamma * nq_reg
 
             loss_sum += F.mse_loss(q_val, target.detach())
 
@@ -881,13 +882,8 @@ class DualDQNAgent:
                     nq_reg = (self.reg_target.forward_from_embeddings(
                                   op_h_reg_t, machine_h_reg_t, na, ng, noi, u_p=nu_p
                               ).max()
-                              if next_reg else torch.tensor(-1e9, device=self.device))
-                    nq_asm = (self.asm_target.forward_from_embeddings(
-                                  op_h_asm_t, machine_h_asm_t, na, noi, njm, c_p=nc_p
-                              ).max()
-                              if next_asm else torch.tensor(-1e9, device=self.device))
-                    next_val = torch.max(nq_reg, nq_asm)
-                target = torch.tensor(float(reward), device=self.device) + self.gamma * next_val
+                              if next_reg else torch.tensor(0.0, device=self.device))
+                target = torch.tensor(float(reward), device=self.device) + self.gamma * nq_reg
 
             losses.append(F.smooth_l1_loss(q_val, target.detach()))
 
@@ -959,16 +955,11 @@ class DualDQNAgent:
                 with torch.no_grad():
                     nc_p = self.reg_target.compute_C_p_from_embeddings(op_h_reg_t, next_obs)
                     nu_p = self.asm_target.compute_U_p_from_embeddings(op_h_asm_t, ng, next_obs)
-                    nq_reg = (self.reg_target.forward_from_embeddings(
-                                  op_h_reg_t, machine_h_reg_t, na, ng, noi, u_p=nu_p
-                              ).max()
-                              if next_reg else torch.tensor(-1e9, device=self.device))
                     nq_asm = (self.asm_target.forward_from_embeddings(
                                   op_h_asm_t, machine_h_asm_t, na, noi, njm, c_p=nc_p
                               ).max()
-                              if next_asm else torch.tensor(-1e9, device=self.device))
-                    next_val = torch.max(nq_reg, nq_asm)
-                target = torch.tensor(float(reward), device=self.device) + self.gamma * next_val
+                              if next_asm else torch.tensor(0.0, device=self.device))
+                target = torch.tensor(float(reward), device=self.device) + self.gamma * nq_asm
 
             losses.append(F.smooth_l1_loss(q_val, target.detach()))
 
@@ -1018,12 +1009,9 @@ class DualDQNAgent:
                 next_reg = [a for a in na if not _is_assembly(a)]
                 next_asm = [a for a in na if     _is_assembly(a)]
                 with torch.no_grad():
-                    nq_reg = (self.reg_target(ng, na, np_, noi, u_p=nu_p).max()
-                              if next_reg else torch.tensor(-1e9, device=self.device))
                     nq_asm = (self.asm_target(ng, na, np_, noi, njm, c_p=nc_p).max()
-                              if next_asm else torch.tensor(-1e9, device=self.device))
-                next_val = torch.max(nq_reg, nq_asm)
-                target = torch.tensor(float(reward), device=self.device) + self.gamma * next_val
+                              if next_asm else torch.tensor(0.0, device=self.device))
+                target = torch.tensor(float(reward), device=self.device) + self.gamma * nq_asm
 
             loss_sum += F.mse_loss(q_val, target.detach())
 
