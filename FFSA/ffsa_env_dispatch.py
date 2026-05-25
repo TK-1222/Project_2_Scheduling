@@ -378,7 +378,8 @@ class FFSASchedulingEnv(gym.Env):
     def step(self, action_idx: int):
         actions = self._current_actions
         if action_idx >= len(actions):
-            return self._get_obs(), -1.0, False, False, {}
+            # 액션 없음 → 진행 불가, truncated 처리
+            return self._get_obs(), -1.0, False, True, {"deadlock": True}
 
         action = actions[action_idx]
         self._deadlock_detected = False
@@ -490,9 +491,8 @@ class FFSASchedulingEnv(gym.Env):
                           if op.active and op.is_processing]
 
             if not processing:
-                blocked = [ms for ms in self.machine_states.values() if ms.is_blocked]
-                if blocked:
-                    self._deadlock_detected = True
+                # 처리 중인 op도 없고 유효 액션도 없음 → 진행 불가 상태
+                self._deadlock_detected = True
                 break
 
             next_time = min(op.completion_time for op in processing)
