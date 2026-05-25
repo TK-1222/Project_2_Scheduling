@@ -37,6 +37,8 @@ def main():
                         help="첫 번째 에피소드 간트 차트를 PNG로 저장")
     parser.add_argument("--report",      action="store_true",
                         help="첫 번째 에피소드 스케줄 리포트를 TXT 파일로 저장")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="단일 seed 지정 시 해당 seed 1회만 실행 (기본: 10000~10049)")
     args = parser.parse_args()
 
     # 체크포인트 경로에서 runs/<exp_name> 디렉터리를 추출
@@ -65,8 +67,9 @@ def main():
     agent.epsilon = 0.0   # 완전 greedy
 
     # ── 검증 ──
+    seeds = [args.seed] if args.seed is not None else TEST_SEEDS
     wt_list = []
-    for i, seed in enumerate(TEST_SEEDS):
+    for i, seed in enumerate(seeds):
         config = full_config(seed=seed, num_regular_orders=args.num_orders)
         env    = FFSASchedulingEnv(config)
         obs, _ = env.reset()
