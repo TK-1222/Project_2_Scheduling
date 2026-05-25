@@ -20,6 +20,29 @@ TEST_SEEDS = list(range(10000, 10050))   # 50개
 
 
 # ──────────────────────────────────────────────────────────
+# 공통 유틸
+# ──────────────────────────────────────────────────────────
+
+def get_on_time_rate(env) -> float:
+    """납기 준수율: 납기 내 완료된 주문 수 / 전체 주문 수"""
+    orders = env.instance.orders
+    on_time = 0
+    for order in orders.values():
+        ok = True
+        for fid in order.final_job_ids:
+            last_op = env.operations[env.job_ops[fid][-1]]
+            if not last_op.is_done or last_op.completion_time is None:
+                ok = False
+                break
+            if last_op.completion_time > order.due_date:
+                ok = False
+                break
+        if ok:
+            on_time += 1
+    return on_time / len(orders) if orders else 0.0
+
+
+# ──────────────────────────────────────────────────────────
 # 룰 선택 함수
 # ──────────────────────────────────────────────────────────
 
@@ -112,7 +135,7 @@ def run_rule(rule_name, selector, num_orders, seeds=None):
     if seeds is None:
         seeds = TEST_SEEDS
     print(f"\n── {rule_name} ──")
-    wt_list = []
+    wt_list, otr_list = [], []
     for i, seed in enumerate(seeds):
         config = full_config(seed=seed, num_regular_orders=num_orders)
         env    = FFSASchedulingEnv(config)
@@ -127,23 +150,24 @@ def run_rule(rule_name, selector, num_orders, seeds=None):
             step_count += 1
 
         if step_count >= max_steps:
-            print(f"  [{i+1:2d}/50]  seed={seed}  WT=TIMEOUT (max_steps 초과)")
+            print(f"  [{i+1:2d}]  seed={seed}  WT=TIMEOUT")
             wt_list.append(float('inf'))
+            otr_list.append(0.0)
             continue
 
-        wt = env.get_actual_weighted_tardiness()
+        wt  = env.get_actual_weighted_tardiness()
+        otr = get_on_time_rate(env)
         wt_list.append(wt)
-        print(f"  [{i+1:2d}/50]  seed={seed}  WT={wt:.4f}")
+        otr_list.append(otr)
+        print(f"  [{i+1:2d}]  seed={seed}  WT={wt:.2f}  납기준수율={otr*100:.1f}%")
 
-    arr = np.array(wt_list)
-    print(f"\n{rule_name} 결과  (num_orders={num_orders}, 50회)")
-    print(f"  평균      : {arr.mean():.4f}")
-    print(f"  표준편차  : {arr.std():.4f}")
-    print(f"  최솟값    : {arr.min():.4f}")
-    print(f"  최댓값    : {arr.max():.4f}")
-    print(f"\n전체 WT 리스트:")
-    print([round(v, 4) for v in wt_list])
-    return wt_list
+    wt_arr  = np.array(wt_list)
+    otr_arr = np.array(otr_list)
+    n = len(seeds)
+    print(f"\n{rule_name} 결과  ({n}회)")
+    print(f"  평균 WT        : {wt_arr.mean():.4f}  (표준편차 {wt_arr.std():.4f})")
+    print(f"  평균 납기준수율: {otr_arr.mean()*100:.1f}%  (표준편차 {otr_arr.std()*100:.1f}%)")
+    return wt_list, otr_list
 
 
 def main():
@@ -161,13 +185,14 @@ def main():
         results[name] = run_rule(name, selector, args.num_orders, seeds)
 
     # ── 최종 요약 ──
-    print(f"\n{'='*50}")
-    print(f"{'룰':<8}  {'평균 WT':>10}  {'표준편차':>10}")
-    print(f"{'-'*50}")
-    for name, wt_list in results.items():
-        arr = np.array(wt_list)
-        print(f"{name:<8}  {arr.mean():>10.4f}  {arr.std():>10.4f}")
-    print(f"{'='*50}")
+    print(f"\n{'='*60}")
+    print(f"{'룰':<8}  {'평균 WT':>12}  {'표준편차':>10}  {'납기준수율':>10}")
+    print(f"{'-'*60}")
+    for name, (wt_list, otr_list) in results.items():
+        wt_arr  = np.array(wt_list)
+        otr_arr = np.array(otr_list)
+        print(f"{name:<8}  {wt_arr.mean():>12.4f}  {wt_arr.std():>10.4f}  {otr_arr.mean()*100:>9.1f}%")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

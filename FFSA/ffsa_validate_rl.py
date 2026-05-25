@@ -21,6 +21,25 @@ from ffsa_instance import full_config, OpFeat
 from ffsa_env_dispatch import FFSASchedulingEnv
 from ffsa_model import RegularQNetwork, AssemblyQNetwork, DualDQNAgent
 
+
+def get_on_time_rate(env) -> float:
+    """납기 준수율: 납기 내 완료된 주문 수 / 전체 주문 수"""
+    orders = env.instance.orders
+    on_time = 0
+    for order in orders.values():
+        ok = True
+        for fid in order.final_job_ids:
+            last_op = env.operations[env.job_ops[fid][-1]]
+            if not last_op.is_done or last_op.completion_time is None:
+                ok = False
+                break
+            if last_op.completion_time > order.due_date:
+                ok = False
+                break
+        if ok:
+            on_time += 1
+    return on_time / len(orders) if orders else 0.0
+
 # ── 두 스크립트 공통 시드 (dispatching rule 비교와 동일 인스턴스 사용) ──
 TEST_SEEDS = list(range(10000, 10050))   # 50개
 
@@ -68,7 +87,7 @@ def main():
 
     # ── 검증 ──
     seeds = [args.seed] if args.seed is not None else TEST_SEEDS
-    wt_list = []
+    wt_list, otr_list = [], []
     for i, seed in enumerate(seeds):
         config = full_config(seed=seed, num_regular_orders=args.num_orders)
         env    = FFSASchedulingEnv(config)
@@ -83,13 +102,16 @@ def main():
             step_count += 1
 
         if step_count >= max_steps:
-            print(f"  [{i+1:2d}/50]  seed={seed}  WT=TIMEOUT (max_steps 초과)")
+            print(f"  [{i+1:2d}]  seed={seed}  WT=TIMEOUT")
             wt_list.append(float('inf'))
+            otr_list.append(0.0)
             continue
 
-        wt = env.get_actual_weighted_tardiness()
+        wt  = env.get_actual_weighted_tardiness()
+        otr = get_on_time_rate(env)
         wt_list.append(wt)
-        print(f"  [{i+1:2d}/50]  seed={seed}  WT={wt:.4f}")
+        otr_list.append(otr)
+        print(f"  [{i+1:2d}]  seed={seed}  WT={wt:.2f}  납기준수율={otr*100:.1f}%")
 
         if i == 0:
             if args.gantt:
@@ -105,13 +127,15 @@ def main():
                     save_path=os.path.join(run_dir, f"schedule_report_seed{seed}.txt"),
                 )
 
-    arr = np.array(wt_list)
+    n = len(seeds)
+    wt_arr  = np.array(wt_list)
+    otr_arr = np.array(otr_list)
     print(f"\n{'='*40}")
-    print(f"RL 에이전트 결과  (num_orders={args.num_orders}, 50회)")
-    print(f"  평균      : {arr.mean():.4f}")
-    print(f"  표준편차  : {arr.std():.4f}")
-    print(f"  최솟값    : {arr.min():.4f}")
-    print(f"  최댓값    : {arr.max():.4f}")
+    print(f"RL 에이전트 결과  (num_orders={args.num_orders}, {n}회)")
+    print(f"  평균 WT        : {wt_arr.mean():.4f}  (표준편차 {wt_arr.std():.4f})")
+    print(f"  평균 납기준수율: {otr_arr.mean()*100:.1f}%  (표준편차 {otr_arr.std()*100:.1f}%)")
+    print(f"  최솟값 WT      : {wt_arr.min():.4f}")
+    print(f"  최댓값 WT      : {wt_arr.max():.4f}")
     print(f"\n전체 WT 리스트:")
     print([round(v, 4) for v in wt_list])
 
