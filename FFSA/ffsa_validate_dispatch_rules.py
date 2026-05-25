@@ -108,10 +108,12 @@ RULES = {
 # 검증 루프
 # ──────────────────────────────────────────────────────────
 
-def run_rule(rule_name, selector, num_orders):
+def run_rule(rule_name, selector, num_orders, seeds=None):
+    if seeds is None:
+        seeds = TEST_SEEDS
     print(f"\n── {rule_name} ──")
     wt_list = []
-    for i, seed in enumerate(TEST_SEEDS):
+    for i, seed in enumerate(seeds):
         config = full_config(seed=seed, num_regular_orders=num_orders)
         env    = FFSASchedulingEnv(config)
         obs, _ = env.reset()
@@ -148,11 +150,15 @@ def main():
     parser = argparse.ArgumentParser(description="디스패칭룰 검증 (FIFO/EDD/MWKR)")
     parser.add_argument("--num-orders", type=int, default=6,
                         help="정규주문 수 (기본 6 ≈ 50 jobs)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="단일 seed 지정 시 해당 seed 1회만 실행 (기본: 10000~10049)")
     args = parser.parse_args()
+
+    seeds = [args.seed] if args.seed is not None else TEST_SEEDS
 
     results = {}
     for name, selector in RULES.items():
-        results[name] = run_rule(name, selector, args.num_orders)
+        results[name] = run_rule(name, selector, args.num_orders, seeds)
 
     # ── 최종 요약 ──
     print(f"\n{'='*50}")
