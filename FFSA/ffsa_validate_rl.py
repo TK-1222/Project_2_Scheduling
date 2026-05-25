@@ -71,10 +71,18 @@ def main():
         env    = FFSASchedulingEnv(config)
         obs, _ = env.reset()
         done = truncated = False
+        max_steps = 50000
+        step_count = 0
 
-        while not (done or truncated):
+        while not (done or truncated) and step_count < max_steps:
             action_idx = agent.select_action(obs)
             obs, _, done, truncated, _ = env.step(action_idx)
+            step_count += 1
+
+        if step_count >= max_steps:
+            print(f"  [{i+1:2d}/50]  seed={seed}  WT=TIMEOUT (max_steps 초과)")
+            wt_list.append(float('inf'))
+            continue
 
         wt = env.get_actual_weighted_tardiness()
         wt_list.append(wt)
