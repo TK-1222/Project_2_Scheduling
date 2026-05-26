@@ -262,10 +262,12 @@ class FFSASchedulingEnv(gym.Env):
         self.num_machines = self.instance.num_machines
         self.current_time = 0.0
 
-        # 조립 버퍼: product_id → {comp_type_idx: [job_id, ...]}
-        self.assembly_pool: Dict[int, Dict[int, List[int]]] = {}
-        # 미활성 final job: product_id → [job_id, ...]
-        self.inactive_final_jobs: Dict[int, List[int]] = {}
+        # 조립 버퍼: {prod_id: {(order_id, unit_idx): {comp_type: job_id}}}  — Constraint 5
+        self.assembly_pool: Dict[int, Dict[Tuple[int, int], Dict[int, int]]] = {}
+        # 미활성 final job: {(prod_id, order_id, unit_idx): final_job_id}
+        self.inactive_final_jobs: Dict[Tuple[int, int, int], int] = {}
+        # 조립 버퍼 만원으로 blocked된 컴포넌트  — Constraint 10
+        self._pool_blocked: Dict[int, int] = {}  # job_id → machine_id
 
         self.job_ops: Dict[int, List[int]] = {}
         self.op_to_job_stage: Dict[int, Tuple[int, int]] = {}
@@ -354,12 +356,16 @@ class FFSASchedulingEnv(gym.Env):
     def _init_assembly_pool(self):
         """조립 버퍼 pool 및 정규주문 final job 초기화"""
         self.assembly_pool = {p: {} for p in self.instance.products}
-        self.inactive_final_jobs = {p: [] for p in self.instance.products}
+        self.inactive_final_jobs = {}
+        self._pool_blocked = {}
         if not self.config.use_assembly:
             return
         for order in self.instance.orders.values():
             for fid in order.final_job_ids:
-                self.inactive_final_jobs[order.product_id].append(fid)
+                job = self.instance.jobs[fid]
+                # (prod_id, order_id, unit_idx) 키로 final job 등록 — Constraint 5
+                key = (order.product_id, order.order_id, job.order_unit_idx)
+                self.inactive_final_jobs[key] = fid
 
     def _load_initial_jobs(self):
         """t=0 도착 job을 stage 0 버퍼에 투입 (final job 제외: 조립 dispatch 전까지 비활성)"""
@@ -418,8 +424,10 @@ class FFSASchedulingEnv(gym.Env):
 
         self.buffers[op.stage_id].remove(op.job_id)
         op.buffer_waiting = False
+        # Constraint 1: 단일 할당 — op에 machine_id 하나만 기록
         op.machine_id = machine_id
 
+        # Constraint 3+6: 완료시간 = 시작시간 + 준비시간(s) + 처리시간(p)
         setup = self._get_setup_time(ms.last_product, op.product_id, op.stage_id, machine_id)
         job = self.instance.jobs[op.job_id]
         if job.is_component:
@@ -438,17 +446,25 @@ class FFSASchedulingEnv(gym.Env):
         ms.remaining_time = total
 
     def _dispatch_assembly(self, comp_job_ids: Tuple[int, ...], machine_id: int):
-        """조립 dispatch: 컴포넌트 소비 → final job 활성화 → 조립 op 시작"""
-        product_id = self.instance.jobs[comp_job_ids[0]].product_id
+        """조립 dispatch: 동일 unit 컴포넌트 소비 → final job 활성화 → 조립 op 시작"""
+        first_job = self.instance.jobs[comp_job_ids[0]]
+        product_id = first_job.product_id
+        unit_key  = (first_job.order_id, first_job.order_unit_idx)
+        final_key = (product_id, first_job.order_id, first_job.order_unit_idx)
         asm_stage = self.instance.config.assembly_stage_idx
 
-        # pool에서 컴포넌트 소비 (가변 개수)
+        # Constraint 5: 동일 unit 컴포넌트만 소비
         for job_id in comp_job_ids:
             comp_type = self.instance.jobs[job_id].component_type_idx
-            self.assembly_pool[product_id][comp_type].remove(job_id)
+            del self.assembly_pool[product_id][unit_key][comp_type]
+        if not self.assembly_pool[product_id][unit_key]:
+            del self.assembly_pool[product_id][unit_key]
 
-        # 미활성 final job 활성화
-        final_job_id = self.inactive_final_jobs[product_id].pop(0)
+        # Constraint 10: 조립 후 pool 여유 생기면 blocked 기계 해제
+        self._try_unblock_pool()
+
+        # Constraint 5: 동일 unit의 final job 활성화
+        final_job_id = self.inactive_final_jobs.pop(final_key)
         for op_id in self.job_ops[final_job_id]:
             self.operations[op_id].active = True
 
@@ -537,12 +553,26 @@ class FFSASchedulingEnv(gym.Env):
                 # component job 완료 → assembly pool 진입
                 if job.is_component:
                     comp_type = job.component_type_idx
-                    prod_id = job.product_id
-                    pool = self.assembly_pool[prod_id]
-                    if comp_type not in pool:
-                        pool[comp_type] = []
-                    if job_id not in pool[comp_type]:
-                        pool[comp_type].append(job_id)
+                    prod_id   = job.product_id
+                    unit_key  = (job.order_id, job.order_unit_idx)
+                    pool      = self.assembly_pool[prod_id]
+                    # Constraint 10: 조립 버퍼 용량 제한
+                    asm_cap      = self.instance.config.assembly_buffer_capacity
+                    total_in_pool = sum(len(ud) for ud in pool.values())
+                    if asm_cap > 0 and total_in_pool >= asm_cap:
+                        # 버퍼 가득 → 기계 blocked
+                        if op.machine_id is not None:
+                            ms = self.machine_states[op.machine_id]
+                            if not ms.is_blocked:
+                                ms.is_blocked = True
+                                ms.is_idle    = False
+                                ms.blocked_job = job_id
+                                self._pool_blocked[job_id] = op.machine_id
+                    else:
+                        # Constraint 5: unit_key 단위로 pool에 저장
+                        if unit_key not in pool:
+                            pool[unit_key] = {}
+                        pool[unit_key][comp_type] = job_id
                 continue
 
             # 다음 op이 있으면 다음 stage 버퍼로 이동
@@ -555,6 +585,7 @@ class FFSASchedulingEnv(gym.Env):
             next_stage = next_op.stage_id
             buffer = self.buffers[next_stage]
 
+            # Constraint 9: 일반 버퍼 용량 제한 WIP_j(t) ≤ B_j
             if buffer.has_space():
                 if job_id not in buffer.queue:
                     buffer.push(job_id)
@@ -581,6 +612,8 @@ class FFSASchedulingEnv(gym.Env):
             if not ms.is_blocked or ms.blocked_job is None:
                 continue
             job_id = ms.blocked_job
+            if job_id in self._pool_blocked:
+                continue  # Constraint 10: pool-blocked는 _try_unblock_pool에서 처리
             op_list = self.job_ops[job_id]
             for idx, oid in enumerate(op_list):
                 op = self.operations[oid]
@@ -597,6 +630,27 @@ class FFSASchedulingEnv(gym.Env):
                             ms.current_op = None
                             break
 
+    def _try_unblock_pool(self):
+        """Constraint 10: 조립 버퍼 여유 생기면 대기 중 컴포넌트 투입 & 기계 해제"""
+        asm_cap = self.instance.config.assembly_buffer_capacity
+        for job_id in list(self._pool_blocked.keys()):
+            job      = self.instance.jobs[job_id]
+            prod_id  = job.product_id
+            comp_type = job.component_type_idx
+            unit_key = (job.order_id, job.order_unit_idx)
+            pool     = self.assembly_pool[prod_id]
+            total_in_pool = sum(len(ud) for ud in pool.values())
+            if asm_cap <= 0 or total_in_pool < asm_cap:
+                if unit_key not in pool:
+                    pool[unit_key] = {}
+                pool[unit_key][comp_type] = job_id
+                mid = self._pool_blocked.pop(job_id)
+                ms  = self.machine_states[mid]
+                ms.is_blocked  = False
+                ms.is_idle     = True
+                ms.blocked_job = None
+                ms.current_op  = None
+
     # ──────────────────────────────────────────────────────
     # Ready 판정
     # ──────────────────────────────────────────────────────
@@ -607,6 +661,7 @@ class FFSASchedulingEnv(gym.Env):
             if not op.active or op.is_done or op.is_processing:
                 op.is_ready = False
                 continue
+            # Constraint 4: 선행 operation이 모두 완료되어야 시작 가능
             pred_done = all(
                 self.operations[pid].is_done
                 for pid in op.predecessors
@@ -623,10 +678,13 @@ class FFSASchedulingEnv(gym.Env):
         ms = self.machine_states[machine_id]
         if not op.active or op.is_done:          return False
         if not op.is_ready:                       return False
+        # Constraint 1: 단일 할당 — 이미 처리 중이면 재할당 불가
         if op.is_processing:                      return False
+        # Constraint 6: 기계는 동시에 하나의 작업만 처리
         if not ms.is_idle or ms.is_blocked:       return False
         if ms.stage_id != op.stage_id:            return False
         job = self.instance.jobs[op.job_id]
+        # Constraint 2: 기계적합성 — 기계가 해당 제품/stage를 처리 가능해야 함
         if job.is_component:
             if (job.product_id, job.component_type_idx) not in ms.compatible_component_ops:
                 return False
@@ -636,41 +694,39 @@ class FFSASchedulingEnv(gym.Env):
         return True
 
     def _get_valid_assembly_actions(self) -> List[AssemblyAction]:
-        """조립 가능 (comp_A, comp_B, machine) 조합 반환"""
+        """Constraint 5: 조립 조건 — 동일 unit의 모든 컴포넌트 타입이 pool에 존재해야 조립 가능"""
         actions = []
         asm_stage = self.instance.config.assembly_stage_idx
 
-        for prod_id, type_pool in self.assembly_pool.items():
-            # 제품별 컴포넌트 수 조회
+        for prod_id, unit_groups in self.assembly_pool.items():
             num_types = self.instance.products[prod_id].num_components
-            # 컴포넌트가 1개 이하면 조립 불필요
             if num_types < 2:
                 continue
-            # 모든 타입이 pool에 ≥1개 존재해야 조립 가능
-            if len(type_pool) < num_types:
-                continue
-            if not all(len(type_pool.get(t, [])) >= 1 for t in range(num_types)):
-                continue
-            # 미활성 final job이 없으면 조립 불가
-            if not self.inactive_final_jobs.get(prod_id):
-                continue
 
-            # 호환 조립 기계
-            asm_machines = [
-                mid for mid in self.instance.machines_by_stage.get(asm_stage, [])
-                if (prod_id in self.machine_states[mid].compatible_final_ops
-                    and self.machine_states[mid].is_idle
-                    and not self.machine_states[mid].is_blocked)
-            ]
-            if not asm_machines:
-                continue
+            for unit_key, comp_dict in unit_groups.items():
+                order_id, unit_idx = unit_key
+                # Constraint 5: 동일 unit의 모든 컴포넌트 타입이 pool에 있어야 함
+                if not all(t in comp_dict for t in range(num_types)):
+                    continue
+                # 해당 unit의 미활성 final job 존재 확인
+                final_key = (prod_id, order_id, unit_idx)
+                if final_key not in self.inactive_final_jobs:
+                    continue
 
-            # 타입 0 × 타입 1 × ... × 타입 (num_types-1) 모든 조합
-            from itertools import product as iterproduct
-            type_lists = [type_pool[t] for t in range(num_types)]
-            for combo in iterproduct(*type_lists):
+                # Constraint 2: 호환 조립 기계 (idle + 제품 호환)
+                asm_machines = [
+                    mid for mid in self.instance.machines_by_stage.get(asm_stage, [])
+                    if (prod_id in self.machine_states[mid].compatible_final_ops
+                        and self.machine_states[mid].is_idle
+                        and not self.machine_states[mid].is_blocked)
+                ]
+                if not asm_machines:
+                    continue
+
+                # 동일 unit 컴포넌트 tuple (타입 순서 고정)
+                comp_ids = tuple(comp_dict[t] for t in range(num_types))
                 for mid in asm_machines:
-                    actions.append((combo, mid))   # ((comp1, comp2, ...), machine_id)
+                    actions.append((comp_ids, mid))
 
         return actions
 
@@ -896,11 +952,19 @@ class FFSASchedulingEnv(gym.Env):
                     if job.product_id in self.instance.machines[mid].compatible_final_ops
                 ]
 
-        # 조립 pool 정보 (state feature용)
-        assembly_pool_info = {
-            prod_id: {t: list(jobs) for t, jobs in type_pool.items()}
-            for prod_id, type_pool in self.assembly_pool.items()
-        }
+        # 조립 pool 정보 — 모델 호환을 위해 {prod_id: {comp_type: [job_id,...]}} 로 직렬화
+        assembly_pool_info: Dict[int, Dict[int, List[int]]] = {}
+        for prod_id, unit_groups in self.assembly_pool.items():
+            flat: Dict[int, List[int]] = {}
+            for comp_dict in unit_groups.values():
+                for comp_type, job_id in comp_dict.items():
+                    flat.setdefault(comp_type, []).append(job_id)
+            assembly_pool_info[prod_id] = flat
+
+        # inactive_final_jobs — {prod_id: [job_id,...]} 로 직렬화
+        inactive_info: Dict[int, List[int]] = {}
+        for (prod_id, _oid, _uid), job_id in self.inactive_final_jobs.items():
+            inactive_info.setdefault(prod_id, []).append(job_id)
 
         return {
             "graph": graph,
@@ -912,7 +976,7 @@ class FFSASchedulingEnv(gym.Env):
                 "candidate_machines": candidate_machines,
             },
             "assembly_pool": assembly_pool_info,
-            "inactive_final_jobs": {p: list(v) for p, v in self.inactive_final_jobs.items()},
+            "inactive_final_jobs": inactive_info,
             "job_op_map": {jid: list(ops) for jid, ops in self.job_ops.items()},
         }
 
@@ -928,7 +992,7 @@ class FFSASchedulingEnv(gym.Env):
         return -delta
 
     def _compute_actual_weighted_tardiness(self) -> float:
-        """완료된 final job에 대해 주문 납기 기준 tardiness 합산"""
+        """Constraint 8: T_p = max(0, E_last - d_p) — 완료된 final job 기준 가중 지연 합산"""
         total = 0.0
         for order in self.instance.orders.values():
             weight = order.weight
