@@ -507,8 +507,10 @@ class FFSASchedulingEnv(gym.Env):
                           if op.active and op.is_processing]
 
             if not processing:
-                # 처리 중인 op도 없고 유효 액션도 없음 → 진행 불가 상태
-                self._deadlock_detected = True
+                # 처리 중인 op도 없고 유효 액션도 없음
+                # done 상태이면 정상 종료, 아니면 deadlock
+                if not self._check_done():
+                    self._deadlock_detected = True
                 break
 
             next_time = min(op.completion_time for op in processing)
