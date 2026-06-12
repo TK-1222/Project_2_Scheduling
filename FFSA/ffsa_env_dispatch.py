@@ -736,6 +736,222 @@ class FFSASchedulingEnv(gym.Env):
     # Dispatching Rules
     # ──────────────────────────────────────────────────────
 
+    # ── 조립 공정 헬퍼 ──────────────────────────────────────
+
+    def _assemblable_products(self) -> List[int]:
+        """조립 가능 제품 목록: pool 완비 + inactive final_job 존재 + idle 조립 기계 존재"""
+        asm_stage = self.instance.config.assembly_stage_idx
+        result = []
+        for prod_id, unit_groups in self.assembly_pool.items():
+            num_types = self.instance.products[prod_id].num_components
+            if num_types < 2:
+                continue
+            has_ready_unit = any(
+                all(t in comp_dict for t in range(num_types))
+                and (prod_id, uk[0], uk[1]) in self.inactive_final_jobs
+                for uk, comp_dict in unit_groups.items()
+            )
+            if not has_ready_unit:
+                continue
+            has_machine = any(
+                prod_id in self.machine_states[mid].compatible_final_ops
+                and self.machine_states[mid].is_idle
+                and not self.machine_states[mid].is_blocked
+                for mid in self.instance.machines_by_stage.get(asm_stage, [])
+            )
+            if has_machine:
+                result.append(prod_id)
+        return result
+
+    def _best_asm_machine(self, prod_id: int) -> Optional[int]:
+        """해당 제품 조립 stage에서 처리시간 최소 idle 기계 반환"""
+        asm_stage = self.instance.config.assembly_stage_idx
+        best_mid, best_t = None, float('inf')
+        for mid in self.instance.machines_by_stage.get(asm_stage, []):
+            ms = self.machine_states[mid]
+            if not ms.is_idle or ms.is_blocked:
+                continue
+            if prod_id not in ms.compatible_final_ops:
+                continue
+            t = self.instance.processing_times_final.get((prod_id, asm_stage, mid), float('inf'))
+            if t < best_t:
+                best_t = t
+                best_mid = mid
+        return best_mid
+
+    def _select_comp_jobs_fifo(self, prod_id: int) -> Optional[Tuple[int, ...]]:
+        """FIFO: 각 타입에서 job_id 가장 작은(가장 먼저 생성된) unit의 comp_job 선택"""
+        num_types = self.instance.products[prod_id].num_components
+        best_comp_ids, best_key = None, None
+        for unit_key, comp_dict in self.assembly_pool[prod_id].items():
+            if not all(t in comp_dict for t in range(num_types)):
+                continue
+            if (prod_id, unit_key[0], unit_key[1]) not in self.inactive_final_jobs:
+                continue
+            comp_ids = tuple(comp_dict[t] for t in range(num_types))
+            key = min(comp_ids)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_comp_ids = comp_ids
+        return best_comp_ids
+
+    def _select_comp_jobs_edd(self, prod_id: int) -> Optional[Tuple[int, ...]]:
+        """EDD: 납기 가장 빠른 final_job에 대응하는 unit의 comp_job 선택"""
+        num_types = self.instance.products[prod_id].num_components
+        best_comp_ids, best_due = None, float('inf')
+        for unit_key, comp_dict in self.assembly_pool[prod_id].items():
+            if not all(t in comp_dict for t in range(num_types)):
+                continue
+            final_key = (prod_id, unit_key[0], unit_key[1])
+            if final_key not in self.inactive_final_jobs:
+                continue
+            fid = self.inactive_final_jobs[final_key]
+            due = self.instance.jobs[fid].due_date
+            if due < best_due:
+                best_due = due
+                best_comp_ids = tuple(comp_dict[t] for t in range(num_types))
+        return best_comp_ids
+
+    def _final_job_remaining_work(self, fid: int) -> float:
+        """inactive final_job의 잔여 최소 처리시간 합산 (조립 stage + post-asm 전체)"""
+        job = self.instance.jobs[fid]
+        total = 0.0
+        for stage_id in job.route:
+            compat = [
+                mid for mid in self.instance.machines_by_stage.get(stage_id, [])
+                if job.product_id in self.instance.machines[mid].compatible_final_ops
+            ]
+            times = [
+                self.instance.processing_times_final.get((job.product_id, stage_id, mid), 0.0)
+                for mid in compat
+            ]
+            total += min(times) if times else 0.0
+        return total
+
+    def _best_ready_unit(self, prod_id: int, key_fn) -> Optional[Tuple[int, ...]]:
+        """key_fn 기준으로 최선 unit의 comp_ids 반환 (공통 unit 선택 로직)"""
+        num_types = self.instance.products[prod_id].num_components
+        best_comp_ids, best_key = None, None
+        for unit_key, comp_dict in self.assembly_pool[prod_id].items():
+            if not all(t in comp_dict for t in range(num_types)):
+                continue
+            final_key = (prod_id, unit_key[0], unit_key[1])
+            if final_key not in self.inactive_final_jobs:
+                continue
+            k = key_fn(self.inactive_final_jobs[final_key], unit_key, comp_dict)
+            if best_key is None or k < best_key:
+                best_key = k
+                best_comp_ids = tuple(comp_dict[t] for t in range(num_types))
+        return best_comp_ids
+
+    # ── 조립 공정 디스패칭룰 ────────────────────────────────
+
+    def _apply_fifo_asm(self) -> Optional[Action]:
+        """FIFO_asm: pool에서 job_id 가장 작은(가장 먼저 도착한) comp_job 기준 조립"""
+        best_action, best_key = None, None
+        for prod_id in self._assemblable_products():
+            comp_ids = self._select_comp_jobs_fifo(prod_id)
+            mid = self._best_asm_machine(prod_id)
+            if comp_ids is None or mid is None:
+                continue
+            key = min(comp_ids)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_action = (comp_ids, mid)
+        return best_action
+
+    def _apply_edd_asm(self) -> Optional[Action]:
+        """EDD_asm: 납기 가장 빠른 final_job을 기준으로 제품 및 unit 선택"""
+        best_action, best_due = None, float('inf')
+        for prod_id in self._assemblable_products():
+            num_types = self.instance.products[prod_id].num_components
+            for unit_key, comp_dict in self.assembly_pool[prod_id].items():
+                if not all(t in comp_dict for t in range(num_types)):
+                    continue
+                final_key = (prod_id, unit_key[0], unit_key[1])
+                if final_key not in self.inactive_final_jobs:
+                    continue
+                fid = self.inactive_final_jobs[final_key]
+                due = self.instance.jobs[fid].due_date
+                if due < best_due:
+                    mid = self._best_asm_machine(prod_id)
+                    if mid is not None:
+                        best_due = due
+                        best_action = (tuple(comp_dict[t] for t in range(num_types)), mid)
+        return best_action
+
+    def _apply_mwkr_asm(self) -> Optional[Action]:
+        """MWKR_asm: 잔여 작업량 가장 많은 final_job 기준 (조립 후 처리량 많을수록 우선)"""
+        best_action, best_work = None, -1.0
+        for prod_id in self._assemblable_products():
+            num_types = self.instance.products[prod_id].num_components
+            for unit_key, comp_dict in self.assembly_pool[prod_id].items():
+                if not all(t in comp_dict for t in range(num_types)):
+                    continue
+                final_key = (prod_id, unit_key[0], unit_key[1])
+                if final_key not in self.inactive_final_jobs:
+                    continue
+                fid = self.inactive_final_jobs[final_key]
+                work = self._final_job_remaining_work(fid)
+                if work > best_work:
+                    mid = self._best_asm_machine(prod_id)
+                    if mid is not None:
+                        best_work = work
+                        best_action = (tuple(comp_dict[t] for t in range(num_types)), mid)
+        return best_action
+
+    def _apply_spt_asm(self) -> Optional[Action]:
+        """SPT_asm: 조립 stage 처리시간 가장 짧은 제품/기계 조합 선택"""
+        asm_stage = self.instance.config.assembly_stage_idx
+        best_action, best_t = None, float('inf')
+        for prod_id in self._assemblable_products():
+            for mid in self.instance.machines_by_stage.get(asm_stage, []):
+                ms = self.machine_states[mid]
+                if not ms.is_idle or ms.is_blocked:
+                    continue
+                if prod_id not in ms.compatible_final_ops:
+                    continue
+                t = self.instance.processing_times_final.get((prod_id, asm_stage, mid), float('inf'))
+                if t < best_t:
+                    comp_ids = self._select_comp_jobs_edd(prod_id)
+                    if comp_ids is not None:
+                        best_t = t
+                        best_action = (comp_ids, mid)
+        return best_action
+
+    def _apply_winq_asm(self) -> Optional[Action]:
+        """WINQ_asm: 조립 후 다음 stage 대기 작업량 가장 적은 제품 선택"""
+        asm_stage = self.instance.config.assembly_stage_idx
+        best_action, best_load = None, float('inf')
+        for prod_id in self._assemblable_products():
+            final_stages = self.instance.final_stage_matrix.get(prod_id, [])
+            try:
+                asm_idx = final_stages.index(asm_stage)
+            except ValueError:
+                asm_idx = -1
+            if asm_idx >= 0 and asm_idx < len(final_stages) - 1:
+                next_stage = final_stages[asm_idx + 1]
+                load = 0.0
+                for jid in self.buffers[next_stage].queue:
+                    qjob = self.instance.jobs.get(jid)
+                    if qjob is None:
+                        continue
+                    compat = [
+                        m for m in self.instance.machines_by_stage.get(next_stage, [])
+                        if qjob.product_id in self.instance.machines[m].compatible_final_ops
+                    ]
+                    times = [self.instance.processing_times_final.get((qjob.product_id, next_stage, m), 0.0) for m in compat]
+                    load += min(times) if times else 0.0
+            else:
+                load = 0.0
+            if load < best_load:
+                comp_ids = self._select_comp_jobs_fifo(prod_id)
+                mid = self._best_asm_machine(prod_id)
+                if comp_ids is not None and mid is not None:
+                    best_load = load
+                    best_action = (comp_ids, mid)
+        return best_action
+
     def _remaining_work(self, op: OperationState) -> float:
         """MWKR용: job의 미완료 op 최소 처리시간 합산"""
         total = 0.0
@@ -908,8 +1124,20 @@ class FFSASchedulingEnv(gym.Env):
                             regular_candidates.append(a)
                             seen.add(a)
 
-        # 조립 actions 항상 포함
-        return regular_candidates + self._get_valid_assembly_actions()
+        # 조립 공정 디스패칭룰 후보 (최대 5개)
+        asm_candidates: List[Action] = []
+        asm_seen: set = set()
+        for action in [self._apply_fifo_asm(), self._apply_edd_asm(), self._apply_mwkr_asm(),
+                       self._apply_spt_asm(), self._apply_winq_asm()]:
+            if action is not None and action not in asm_seen:
+                asm_candidates.append(action)
+                asm_seen.add(action)
+
+        # 조립 룰이 후보를 못 찾으면 전체 유효 조립 액션 fallback
+        if not asm_candidates:
+            asm_candidates = self._get_valid_assembly_actions()
+
+        return regular_candidates + asm_candidates
 
     def _has_valid_action(self) -> bool:
         for op in self.operations.values():
@@ -918,7 +1146,7 @@ class FFSASchedulingEnv(gym.Env):
             for mid in self.instance.machines_by_stage.get(op.stage_id, []):
                 if self._is_valid_regular_action(op.op_id, mid):
                     return True
-        return len(self._get_valid_assembly_actions()) > 0
+        return len(self._assemblable_products()) > 0
 
     # ──────────────────────────────────────────────────────
     # Observation
