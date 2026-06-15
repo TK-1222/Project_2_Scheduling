@@ -52,6 +52,7 @@ class InstanceConfig:
     use_assembly: bool = True
     use_setup: bool = True
     use_finite_buffer: bool = True
+    assembly_buffer_capacity: int = -1  # -1 = 무한 (Constraint 10)
     seed: Optional[int] = 42
     # 정규주문 (t=0 도착)
     num_regular_orders: int = 6
