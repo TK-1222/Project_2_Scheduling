@@ -9,7 +9,7 @@ FIFO / EDD / MWKR 디스패칭 룰 기반 후보 생성으로 대체.
 룰이 후보를 못 찾으면 전체 유효 액션 fallback.
 조립 actions는 항상 포함.
 
-Reward: r = -Δ(실제 완료된 주문의 가중 지연)
+Reward: r = -Δ(추정 가중 지연) — dense reward shaping
 """
 
 from dataclasses import dataclass, field
@@ -245,7 +245,7 @@ class FFSASchedulingEnv(gym.Env):
     Flexible Flow Shop with Assembly 스케줄링 환경
 
     조립 제약: 조립 전 버퍼에 동일 제품의 A타입 ≥1 AND B타입 ≥1 존재 시 조립 가능
-    Reward: r = -Δ(실제 완료 주문의 가중 지연합)
+    Reward: r = -Δ(추정 가중 지연) — dense reward shaping (telescoping sum → 실제 WT와 동일 목표)
     """
     metadata = {"render_modes": []}
 
@@ -281,7 +281,7 @@ class FFSASchedulingEnv(gym.Env):
 
         self._current_actions: List[Action] = []
         self._deadlock_detected: bool = False
-        self._prev_actual_wt: float = 0.0
+        self._prev_estimated_wt: float = 0.0
 
     # ──────────────────────────────────────────────────────
     # Reset
@@ -291,7 +291,6 @@ class FFSASchedulingEnv(gym.Env):
         super().reset(seed=seed)
         self.current_time = 0.0
         self._deadlock_detected = False
-        self._prev_actual_wt = 0.0
         # 인스턴스를 매 에피소드 새로 생성 (정규주문 랜덤 변경)
         self.instance = generate_instance(self.config)
         self.graph_builder = GraphBuilder(self.instance)
@@ -301,6 +300,7 @@ class FFSASchedulingEnv(gym.Env):
         self._init_assembly_pool()
         self._load_initial_jobs()
         self.update_ready_operations()
+        self._prev_estimated_wt = self._compute_estimated_weighted_tardiness()
         return self._get_obs(), {}
 
     def _init_operations(self):
@@ -1227,11 +1227,145 @@ class FFSASchedulingEnv(gym.Env):
     # ──────────────────────────────────────────────────────
 
     def _reward_fn(self) -> float:
-        """r = -Δ(weighted tardiness)"""
-        current_wt = self._compute_actual_weighted_tardiness()
-        delta = current_wt - self._prev_actual_wt
-        self._prev_actual_wt = current_wt
+        """r = -Δ(estimated weighted tardiness) — dense reward shaping"""
+        current_est_wt = self._compute_estimated_weighted_tardiness()
+        delta = current_est_wt - self._prev_estimated_wt
+        self._prev_estimated_wt = current_est_wt
         return -delta
+
+    def _avg_proc_time_for_op(self, op_id: int) -> float:
+        """operation 하나에 대해 호환 가능한 기계들의 평균 처리시간. 호환 기계 없으면 35.0 반환."""
+        op = self.operations[op_id]
+        job = self.instance.jobs[op.job_id]
+        times = []
+        if job.is_component:
+            for mid in self.instance.machines_by_stage.get(op.stage_id, []):
+                key = (job.product_id, job.component_type_idx, op.stage_id, mid)
+                if key in self.instance.processing_times:
+                    times.append(self.instance.processing_times[key])
+        else:
+            for mid in self.instance.machines_by_stage.get(op.stage_id, []):
+                key = (job.product_id, op.stage_id, mid)
+                if key in self.instance.processing_times_final:
+                    times.append(self.instance.processing_times_final[key])
+        return float(np.mean(times)) if times else 35.0
+
+    def _estimate_comp_completion(self, comp_job_id: int) -> float:
+        """comp_job 하나가 조립 버퍼에 들어올 예상 시간."""
+        job = self.instance.jobs[comp_job_id]
+        prod_id = job.product_id
+
+        # Case 1: 이미 assembly_pool에 있음 → 현재 시간 반환
+        for comp_dict in self.assembly_pool.get(prod_id, {}).values():
+            if comp_job_id in comp_dict.values():
+                return self.current_time
+
+        # Case 2: pool_blocked → 처리는 완료, pool 진입 대기
+        if comp_job_id in self._pool_blocked:
+            last_op = self.operations[self.job_ops[comp_job_id][-1]]
+            return last_op.completion_time if last_op.completion_time is not None else self.current_time
+
+        op_list = self.job_ops[comp_job_id]
+
+        # Case 3: 현재 처리 중인 op 존재
+        for i, oid in enumerate(op_list):
+            op = self.operations[oid]
+            if op.is_processing:
+                ms = self.machine_states[op.machine_id]
+                finish = self.current_time + ms.remaining_time
+                remaining = sum(self._avg_proc_time_for_op(op_list[j]) for j in range(i + 1, len(op_list)))
+                return finish + remaining
+
+        # Case 4: 버퍼 대기 또는 미시작 — 첫 미완료 op부터 평균 처리시간 합산
+        for i, oid in enumerate(op_list):
+            if not self.operations[oid].is_done:
+                remaining = sum(self._avg_proc_time_for_op(op_list[j]) for j in range(i, len(op_list)))
+                return self.current_time + remaining
+
+        # 모든 op 완료 (pool 체크에서 못 잡힌 경우)
+        last_op = self.operations[op_list[-1]]
+        return last_op.completion_time if last_op.completion_time is not None else self.current_time
+
+    def _estimate_completion_time(self, final_job_id: int) -> float:
+        """final_job 하나의 예상 완료시간. 3가지 케이스로 분기."""
+        job = self.instance.jobs[final_job_id]
+        op_list = self.job_ops[final_job_id]
+        if not op_list:
+            return self.current_time
+
+        last_op = self.operations[op_list[-1]]
+
+        # Case A: 이미 완료
+        if last_op.active and last_op.is_done and last_op.completion_time is not None:
+            return last_op.completion_time
+
+        # Case B: active 상태 (조립 이후 진행 중)
+        if last_op.active:
+            for i, oid in enumerate(op_list):
+                op = self.operations[oid]
+                if op.is_processing:
+                    ms = self.machine_states[op.machine_id]
+                    finish = self.current_time + ms.remaining_time
+                    remaining = sum(self._avg_proc_time_for_op(op_list[j]) for j in range(i + 1, len(op_list)))
+                    return finish + remaining
+            # 처리 중인 op 없음 (버퍼 대기)
+            for i, oid in enumerate(op_list):
+                if not self.operations[oid].is_done:
+                    remaining = sum(self._avg_proc_time_for_op(op_list[j]) for j in range(i, len(op_list)))
+                    return self.current_time + remaining
+            return last_op.completion_time if last_op.completion_time is not None else self.current_time
+
+        # Case C: inactive (조립 전) — comp_type 가용성 기반 추정
+        prod_id = job.product_id
+        num_comp_types = self.instance.products[prod_id].num_components
+        pool = self.assembly_pool.get(prod_id, {})
+
+        comp_ready_times = []
+        for comp_type in range(num_comp_types):
+            earliest: Optional[float] = None
+
+            # assembly_pool에 이미 있는 경우
+            for comp_dict in pool.values():
+                if comp_type in comp_dict:
+                    earliest = self.current_time
+                    break
+
+            # pool_blocked 중에 해당 comp_type
+            if earliest is None:
+                for blocked_jid in self._pool_blocked:
+                    bj = self.instance.jobs[blocked_jid]
+                    if bj.product_id == prod_id and bj.component_type_idx == comp_type:
+                        bop = self.operations[self.job_ops[blocked_jid][-1]]
+                        t = bop.completion_time if bop.completion_time is not None else self.current_time
+                        if earliest is None or t < earliest:
+                            earliest = t
+
+            # 처리 중 또는 버퍼 대기인 comp_job 탐색
+            if earliest is None:
+                for order in self.instance.orders.values():
+                    for cid in order.component_job_ids:
+                        cjob = self.instance.jobs[cid]
+                        if cjob.product_id == prod_id and cjob.component_type_idx == comp_type:
+                            t = self._estimate_comp_completion(cid)
+                            if earliest is None or t < earliest:
+                                earliest = t
+
+            comp_ready_times.append(earliest if earliest is not None else self.current_time)
+
+        asm_start = max(comp_ready_times) if comp_ready_times else self.current_time
+        final_proc = sum(self._avg_proc_time_for_op(oid) for oid in op_list)
+        return asm_start + final_proc
+
+    def _compute_estimated_weighted_tardiness(self) -> float:
+        """모든 final_job의 추정 완료시간 기반 가중 지연 합산."""
+        total = 0.0
+        for order in self.instance.orders.values():
+            weight = order.weight
+            for fid in order.final_job_ids:
+                est_t = self._estimate_completion_time(fid)
+                tp = max(0.0, est_t - order.due_date)
+                total += weight * tp
+        return total
 
     def _compute_actual_weighted_tardiness(self) -> float:
         """Constraint 8: T_p = max(0, E_last - d_p) — 완료된 final job 기준 가중 지연 합산"""
