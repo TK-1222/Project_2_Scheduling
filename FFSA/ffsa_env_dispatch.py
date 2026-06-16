@@ -557,6 +557,12 @@ class FFSASchedulingEnv(gym.Env):
                     prod_id   = job.product_id
                     unit_key  = (job.order_id, job.order_unit_idx)
                     pool      = self.assembly_pool[prod_id]
+                    # 이미 pool에 있으면 재처리 불필요
+                    if pool.get(unit_key, {}).get(comp_type) == job_id:
+                        continue
+                    # 해당 unit이 이미 조립 완료됐으면 재진입 불필요
+                    if (prod_id, job.order_id, job.order_unit_idx) not in self.inactive_final_jobs:
+                        continue
                     # Constraint 10: 조립 버퍼 용량 제한
                     asm_cap      = self.instance.config.assembly_buffer_capacity
                     total_in_pool = sum(len(ud) for ud in pool.values())
