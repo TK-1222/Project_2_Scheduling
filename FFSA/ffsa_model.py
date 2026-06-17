@@ -675,7 +675,7 @@ class DualDQNAgent:
         reg_net: RegularQNetwork,
         asm_net: AssemblyQNetwork,
         lr: float = 2e-4,
-        gamma: float = 1.0,
+        gamma: float = 0.99,
         epsilon_start: float = 1.0,
         epsilon_min: float = 0.05,
         epsilon_decay: float = 0.995,
