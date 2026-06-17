@@ -1,15 +1,14 @@
 """
 FFSA 스케줄링 강화학습 환경 (디스패칭 룰 버전)
 ================================================
-ffsa_env.py 와 동일하나 _get_valid_action_pairs()를
-FIFO / EDD / MWKR 디스패칭 룰 기반 후보 생성으로 대체.
-
-각 룰이 ready op 중 1개를 선택 → 최소 처리시간 기계와 페어링
-→ 중복 제거 후 최대 3개 후보를 GNN에 전달.
-룰이 후보를 못 찾으면 전체 유효 액션 fallback.
-조립 actions는 항상 포함.
+액션 후보 생성 방식:
+  - 일반 공정: FIFO/EDD/MWKR/SPT/WINQ 5개 룰이 각 1개 후보 생성 → 중복 제거.
+    룰이 후보를 못 찾으면 전체 유효 액션 fallback.
+  - 조립 공정: 5개 룰이 컴포넌트 페어 후보 선정 → 각 페어 × 모든 호환 유휴 기계 조합.
+    Q-네트워크가 (페어, 기계) 조합 전체를 평가해 최종 선택.
 
 Reward: r = -Δ(추정 가중 지연) — dense reward shaping
+  텔레스코핑 합: Σr_t = WT_est(0) - WT_est(T), 종료 시 WT_est(T) = WT_actual(T)
 """
 
 from dataclasses import dataclass, field
@@ -558,6 +557,12 @@ class FFSASchedulingEnv(gym.Env):
                     prod_id   = job.product_id
                     unit_key  = (job.order_id, job.order_unit_idx)
                     pool      = self.assembly_pool[prod_id]
+                    # 이미 pool에 있으면 재처리 불필요
+                    if pool.get(unit_key, {}).get(comp_type) == job_id:
+                        continue
+                    # 해당 unit이 이미 조립 완료됐으면 재진입 불필요
+                    if (prod_id, job.order_id, job.order_unit_idx) not in self.inactive_final_jobs:
+                        continue
                     # Constraint 10: 조립 버퍼 용량 제한
                     asm_cap      = self.instance.config.assembly_buffer_capacity
                     total_in_pool = sum(len(ud) for ud in pool.values())
