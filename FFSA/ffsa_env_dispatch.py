@@ -993,47 +993,44 @@ class FFSASchedulingEnv(gym.Env):
                 best_mid = mid
         return best_mid
 
-    def _apply_fifo(self) -> Optional[Action]:
-        """FIFO: 가장 일찍 도착한 job의 ready op 선택"""
+    def _apply_fifo(self) -> Optional[int]:
+        """FIFO: 가장 일찍 도착한 job의 ready op 선택 (op_id만 반환)"""
         ready = [
             op for op in self.operations.values()
             if op.active and op.is_ready and not op.is_processing and not op.is_assembly
         ]
         ready.sort(key=lambda op: self.instance.jobs[op.job_id].job_id)
         for op in ready:
-            mid = self._best_machine_for_op(op)
-            if mid is not None:
-                return (op.op_id, mid)
+            if self._best_machine_for_op(op) is not None:
+                return op.op_id
         return None
 
-    def _apply_edd(self) -> Optional[Action]:
-        """EDD: 납기가 가장 빠른 job의 ready op 선택"""
+    def _apply_edd(self) -> Optional[int]:
+        """EDD: 납기가 가장 빠른 job의 ready op 선택 (op_id만 반환)"""
         ready = [
             op for op in self.operations.values()
             if op.active and op.is_ready and not op.is_processing and not op.is_assembly
         ]
         ready.sort(key=lambda op: self.instance.jobs[op.job_id].due_date)
         for op in ready:
-            mid = self._best_machine_for_op(op)
-            if mid is not None:
-                return (op.op_id, mid)
+            if self._best_machine_for_op(op) is not None:
+                return op.op_id
         return None
 
-    def _apply_mwkr(self) -> Optional[Action]:
-        """MWKR: 잔여 작업량이 가장 큰 job의 ready op 선택"""
+    def _apply_mwkr(self) -> Optional[int]:
+        """MWKR: 잔여 작업량이 가장 큰 job의 ready op 선택 (op_id만 반환)"""
         ready = [
             op for op in self.operations.values()
             if op.active and op.is_ready and not op.is_processing and not op.is_assembly
         ]
         ready.sort(key=lambda op: self._remaining_work(op), reverse=True)
         for op in ready:
-            mid = self._best_machine_for_op(op)
-            if mid is not None:
-                return (op.op_id, mid)
+            if self._best_machine_for_op(op) is not None:
+                return op.op_id
         return None
 
-    def _apply_spt(self) -> Optional[Action]:
-        """SPT: 현재 op 처리시간이 가장 짧은 것 우선"""
+    def _apply_spt(self) -> Optional[int]:
+        """SPT: 현재 op 처리시간이 가장 짧은 것 우선 (op_id만 반환)"""
         ready = [
             op for op in self.operations.values()
             if op.active and op.is_ready and not op.is_processing and not op.is_assembly
@@ -1057,13 +1054,12 @@ class FFSASchedulingEnv(gym.Env):
 
         ready.sort(key=min_proc_time)
         for op in ready:
-            mid = self._best_machine_for_op(op)
-            if mid is not None:
-                return (op.op_id, mid)
+            if self._best_machine_for_op(op) is not None:
+                return op.op_id
         return None
 
-    def _apply_winq(self) -> Optional[Action]:
-        """WINQ: 다음 스테이지 대기 작업량이 가장 적은 op 우선"""
+    def _apply_winq(self) -> Optional[int]:
+        """WINQ: 다음 스테이지 대기 작업량이 가장 적은 op 우선 (op_id만 반환)"""
         ready = [
             op for op in self.operations.values()
             if op.active and op.is_ready and not op.is_processing and not op.is_assembly
@@ -1073,7 +1069,7 @@ class FFSASchedulingEnv(gym.Env):
             job_ops = self.job_ops[op.job_id]
             idx = job_ops.index(op.op_id)
             if idx >= len(job_ops) - 1:
-                return 0.0  # 마지막 op → 다음 스테이지 없음
+                return 0.0
             next_stage = self.operations[job_ops[idx + 1]].stage_id
             total = 0.0
             for jid in self.buffers[next_stage].queue:
@@ -1097,21 +1093,30 @@ class FFSASchedulingEnv(gym.Env):
 
         ready.sort(key=next_queue_work)
         for op in ready:
-            mid = self._best_machine_for_op(op)
-            if mid is not None:
-                return (op.op_id, mid)
+            if self._best_machine_for_op(op) is not None:
+                return op.op_id
         return None
 
     def _get_valid_action_pairs(self) -> List[Action]:
-        # 각 디스패칭 룰이 후보 1개씩 생성, 중복 제거
+        # 일반 공정: 룰 5개 → op 후보 수집 → op × 모든 호환 기계 조합
+        op_candidates: List[int] = []
+        op_seen: set = set()
+        for op_id in [self._apply_fifo(), self._apply_edd(), self._apply_mwkr(),
+                      self._apply_spt(), self._apply_winq()]:
+            if op_id is not None and op_id not in op_seen:
+                op_candidates.append(op_id)
+                op_seen.add(op_id)
+
         regular_candidates: List[Action] = []
         seen: set = set()
-
-        for action in [self._apply_fifo(), self._apply_edd(), self._apply_mwkr(),
-                       self._apply_spt(), self._apply_winq()]:
-            if action is not None and action not in seen:
-                regular_candidates.append(action)
-                seen.add(action)
+        for op_id in op_candidates:
+            op = self.operations[op_id]
+            for mid in self.instance.machines_by_stage.get(op.stage_id, []):
+                if self._is_valid_regular_action(op_id, mid):
+                    a: Action = (op_id, mid)
+                    if a not in seen:
+                        regular_candidates.append(a)
+                        seen.add(a)
 
         # 룰이 후보를 못 찾으면 전체 유효 액션 fallback
         if not regular_candidates:
