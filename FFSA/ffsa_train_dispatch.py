@@ -111,6 +111,46 @@ def run_eval(agent: DualDQNAgent, eval_envs: list) -> float:
 
 
 # ──────────────────────────────────────────────────────────
+# 균형 탐색
+# ──────────────────────────────────────────────────────────
+
+def select_balanced_exploration(obs: dict, env) -> int:
+    """comp type 불균형 감지 → 부족한 타입 우선 선택, 균형이면 전체 랜덤."""
+    actions = obs["actions"]
+
+    # comp type별 진행 수 카운트 (pool 완료 + 처리 중)
+    type_counts: dict = {}
+    for unit_pool in env.assembly_pool.values():
+        for type_map in unit_pool.values():
+            for comp_type in type_map:
+                type_counts[comp_type] = type_counts.get(comp_type, 0) + 1
+    for op in env.operations.values():
+        if op.active and op.is_processing:
+            job = env.instance.jobs[op.job_id]
+            if job.is_component:
+                ct = job.component_type_idx
+                type_counts[ct] = type_counts.get(ct, 0) + 1
+
+    # 불균형 존재 시 부족한 타입 액션 우선
+    if len(type_counts) >= 2:
+        min_count = min(type_counts.values())
+        max_count = max(type_counts.values())
+        if max_count > min_count:
+            urgent = [
+                i for i, action in enumerate(actions)
+                if not _is_assembly(action)
+                and env.instance.jobs[env.operations[action[0]].job_id].is_component
+                and type_counts.get(
+                    env.instance.jobs[env.operations[action[0]].job_id].component_type_idx, 0
+                ) == min_count
+            ]
+            if urgent:
+                return random.choice(urgent)
+
+    return random.randint(0, len(actions) - 1)
+
+
+# ──────────────────────────────────────────────────────────
 # Train
 # ──────────────────────────────────────────────────────────
 
@@ -203,7 +243,10 @@ def train(
             if not obs["actions"]:
                 break
 
-            action_idx = agent.select_action(obs)
+            if random.random() < agent.epsilon:
+                action_idx = select_balanced_exploration(obs, env)
+            else:
+                action_idx = agent.select_greedy(obs)
             next_obs, reward, done, truncated, info = env.step(action_idx)
             step_done = done or truncated
 

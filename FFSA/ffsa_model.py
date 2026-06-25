@@ -724,6 +724,43 @@ class DualDQNAgent:
             u_p = asm_net.compute_U_p(graph, prec, op_id_to_idx, obs)
         return u_p.detach()
 
+    def select_greedy(self, obs: dict) -> int:
+        """ε 없이 순수 Q-value argmax로 액션 선택 (탐색 없음)."""
+        actions = obs["actions"]
+        if not actions:
+            return 0
+
+        graph, _, prec, op_id_to_idx, job_op_map = self._parse_obs(obs)
+
+        with torch.no_grad():
+            op_h_reg, machine_h_reg = self.reg_online.encoder(graph, prec, op_id_to_idx, self.device)
+            op_h_asm, machine_h_asm = self.asm_online.encoder(graph, prec, op_id_to_idx, self.device)
+
+            c_p = self.reg_online.compute_C_p_from_embeddings(op_h_reg, obs)
+            u_p = self.asm_online.compute_U_p_from_embeddings(op_h_asm, graph, obs)
+
+            reg_idx = [i for i, a in enumerate(actions) if not _is_assembly(a)]
+            asm_idx = [i for i, a in enumerate(actions) if     _is_assembly(a)]
+            q_all   = torch.full((len(actions),), -1e9, device=self.device)
+
+            if reg_idx:
+                q_reg = self.reg_online.forward_from_embeddings(
+                    op_h_reg, machine_h_reg, actions, graph, op_id_to_idx, u_p=u_p
+                )
+                for local_i, global_i in enumerate(reg_idx):
+                    if local_i < q_reg.size(0):
+                        q_all[global_i] = q_reg[local_i]
+
+            if asm_idx:
+                q_asm = self.asm_online.forward_from_embeddings(
+                    op_h_asm, machine_h_asm, actions, op_id_to_idx, job_op_map, c_p=c_p
+                )
+                for local_i, global_i in enumerate(asm_idx):
+                    if local_i < q_asm.size(0):
+                        q_all[global_i] = q_asm[local_i]
+
+        return int(q_all.argmax().item())
+
     def select_action(self, obs: dict) -> int:
         """ε-greedy: ε 확률 랜덤, 나머지는 두 네트워크 Q값 통합 argmax.
 
