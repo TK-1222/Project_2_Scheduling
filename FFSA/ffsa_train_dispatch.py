@@ -281,14 +281,6 @@ def train(
                 logger.log_train_step(global_step, last_reg_loss, last_asm_loss)
 
         wt = env.get_actual_weighted_tardiness()
-        if ep_deadlock:
-            # 미완료 final job: 현재 시각을 완료 시각으로 간주해 지연 추가
-            for order in env.instance.orders.values():
-                for fid in order.final_job_ids:
-                    last_op = env.operations[env.job_ops[fid][-1]]
-                    if not (last_op.active and last_op.is_done
-                            and last_op.completion_time is not None):
-                        wt += order.weight * max(0.0, env.current_time - order.due_date)
         ms = env.get_makespan()
 
         episode_rewards.append(total_reward)
