@@ -117,7 +117,7 @@ def run_eval(agent: DualDQNAgent, eval_envs: list) -> float:
 def train(
     config: InstanceConfig,
     num_episodes: int = 500,
-    buffer_size: int = 10000,
+    buffer_size: int = 20000,
     batch_size: int = 64,
     train_freq: int = 4,
     learn_start: int = 1000,
@@ -218,14 +218,7 @@ def train(
             obs = next_obs
 
             if info.get("deadlock"):
-                ep_deadlock   = True
-                total_reward += -100.0
-                # 데드락 terminal transition: done=True이므로 target = -100 (액션 무관)
-                dl_act = next(
-                    (i for i, a in enumerate(obs["actions"]) if not _is_assembly(a)),
-                    0
-                )
-                reg_buffer.push(obs, dl_act, -100.0, obs, True)
+                ep_deadlock = True
                 break
 
             # train_freq 스텝마다 배치 학습 + soft target update
@@ -350,7 +343,7 @@ def test_random_agent(config: InstanceConfig, num_episodes: int = 5):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="FFSA Dual DQN (디스패칭) 학습")
     parser.add_argument("--episodes",           type=int,   default=300)
-    parser.add_argument("--buffer-size",        type=int,   default=10000)
+    parser.add_argument("--buffer-size",        type=int,   default=20000)
     parser.add_argument("--batch-size",         type=int,   default=64)
     parser.add_argument("--train-freq",         type=int,   default=4)
     parser.add_argument("--learn-start",        type=int,   default=1000)
