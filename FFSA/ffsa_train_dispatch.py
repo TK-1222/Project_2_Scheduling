@@ -151,6 +151,28 @@ def select_balanced_exploration(obs: dict, env) -> int:
 
 
 # ──────────────────────────────────────────────────────────
+# 불균형 패널티
+# ──────────────────────────────────────────────────────────
+
+def compute_imbalance_penalty(env, weight: float = 5.0) -> float:
+    """조립 버퍼 + 처리 중인 comp job 기준 comp type 불균형에 비례한 패널티."""
+    type_counts: dict = {}
+    for unit_pool in env.assembly_pool.values():
+        for type_map in unit_pool.values():
+            for comp_type in type_map:
+                type_counts[comp_type] = type_counts.get(comp_type, 0) + 1
+    for op in env.operations.values():
+        if op.active and op.is_processing:
+            job = env.instance.jobs[op.job_id]
+            if job.is_component:
+                ct = job.component_type_idx
+                type_counts[ct] = type_counts.get(ct, 0) + 1
+    if len(type_counts) >= 2:
+        return -(max(type_counts.values()) - min(type_counts.values())) * weight
+    return 0.0
+
+
+# ──────────────────────────────────────────────────────────
 # Train
 # ──────────────────────────────────────────────────────────
 
@@ -168,6 +190,7 @@ def train(
     epsilon_start: float = 1.0,
     epsilon_min: float = 0.05,
     epsilon_decay: float = 0.995,
+    imbalance_weight: float = 5.0,
     hidden_dim: int = 16,
     device: str = "cpu",
     log_interval: int = 10,
@@ -194,6 +217,7 @@ def train(
     print(f"  학습 주기: {train_freq} 스텝마다 | 워밍업: {learn_start} transitions")
     print(f"  Target 업데이트: Soft update (τ={tau}, 매 학습 스텝)")
     print(f"  ε: {epsilon_start} → {epsilon_min} (decay={epsilon_decay})")
+    print(f"  불균형 패널티 weight: {imbalance_weight}")
     print(f"  TensorBoard: runs/{exp_name}")
     print(f"{'='*60}")
 
@@ -249,6 +273,7 @@ def train(
                 action_idx = agent.select_greedy(obs)
             next_obs, reward, done, truncated, info = env.step(action_idx)
             step_done = done or truncated
+            reward += compute_imbalance_penalty(env, imbalance_weight)
 
             # 액션 타입에 따라 버퍼 분리 push
             if _is_assembly(obs["actions"][action_idx]):
@@ -397,6 +422,7 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon-start",      type=float, default=1.0)
     parser.add_argument("--epsilon-min",        type=float, default=0.05)
     parser.add_argument("--epsilon-decay",      type=float, default=0.995)
+    parser.add_argument("--imbalance-weight",   type=float, default=5.0)
     parser.add_argument("--hidden-dim",         type=int,   default=16)
     parser.add_argument("--device",             type=str,   default="cpu")
     parser.add_argument("--exp-name",           type=str,   default=None)
@@ -436,6 +462,7 @@ if __name__ == "__main__":
             epsilon_start=args.epsilon_start,
             epsilon_min=args.epsilon_min,
             epsilon_decay=args.epsilon_decay,
+            imbalance_weight=args.imbalance_weight,
             hidden_dim=args.hidden_dim,
             device=args.device,
             exp_name=exp_name,
