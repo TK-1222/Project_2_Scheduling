@@ -85,10 +85,10 @@ class Logger:
 # 고정 인스턴스 평가
 # ──────────────────────────────────────────────────────────
 
-def run_eval(agent: DualDQNAgent, eval_envs: list, balance_bonus_weight: float = 2.0) -> float:
+def run_eval(agent: DualDQNAgent, eval_envs: list) -> float:
     """
     고정 인스턴스로 greedy 정책 평가 (epsilon=0, 파라미터 업데이트 없음).
-    여러 eval_env의 WT 평균을 반환.
+    순수 Q-value argmax 정책으로 여러 eval_env의 WT 평균을 반환.
     """
     saved_eps = agent.epsilon
     agent.epsilon = 0.0
@@ -100,8 +100,7 @@ def run_eval(agent: DualDQNAgent, eval_envs: list, balance_bonus_weight: float =
         while not done:
             if not obs["actions"]:
                 break
-            bonus = compute_balance_bonus(obs, env, balance_bonus_weight)
-            action_idx = agent.select_greedy(obs, action_bonus=bonus)
+            action_idx = agent.select_greedy(obs)
             obs, _, done, truncated, _ = env.step(action_idx)
             if truncated:
                 break
@@ -275,7 +274,7 @@ def train(
                 break
 
             bonus = compute_balance_bonus(obs, env, balance_bonus_weight)
-            action_idx = agent.select_action(obs, action_bonus=bonus)
+            action_idx = agent.select_action(obs, explore_bonus=bonus)
             next_obs, reward, done, truncated, info = env.step(action_idx)
             step_done = done or truncated
             reward += compute_imbalance_penalty(env, imbalance_weight)
@@ -291,10 +290,11 @@ def train(
             obs = next_obs
 
             if info.get("deadlock"):
-                ep_deadlock   = True
-                total_reward += -100.0
-                dl_act = next((i for i, a in enumerate(obs["actions"]) if not _is_assembly(a)), 0)
-                reg_buffer.push(obs, dl_act, -100.0, obs, True)
+                ep_deadlock = True
+                # done=True이므로 next_obs 내용은 Bellman 타겟에 미사용 (target=r)
+                dl_acts = [i for i, a in enumerate(obs["actions"]) if not _is_assembly(a)]
+                if dl_acts:
+                    reg_buffer.push(obs, dl_acts[0], -100.0, obs, True)
                 break
 
             # train_freq 스텝마다 배치 학습 + soft target update
@@ -327,7 +327,7 @@ def train(
 
         # 고정 인스턴스 평가
         if eval_envs and ep % eval_interval == 0:
-            eval_wt = run_eval(agent, eval_envs, balance_bonus_weight)
+            eval_wt = run_eval(agent, eval_envs)
             logger.log_eval(ep, eval_wt)
             print(f"  → [EVAL] ep={ep}  eval_wt={eval_wt:.2f}")
 

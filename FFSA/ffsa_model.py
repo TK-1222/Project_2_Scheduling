@@ -662,10 +662,12 @@ class DualDQNAgent:
       두 네트워크 Q-value를 통합해 전체 action space에서 argmax.
       · Regular 네트워크 입력 = obs + U_p (Assembly 출력 detach)
       · Assembly 네트워크 입력 = obs + C_p (Regular 출력 detach)
+      · 탐색(ε 구간): explore_bonus softmax 가중치 샘플링으로 균형 편향 탐색
+      · 활용(greedy): 순수 Q-value argmax (보너스 미적용)
 
-    업데이트 (엇갈린 스케줄):
-      · update_regular(): trajectory 내 regular action 스텝만 학습
-      · update_assembly(): trajectory 내 assembly action 스텝만 학습
+    업데이트:
+      · update_regular_batch(): reg_buffer 배치 샘플로 Regular 네트워크 학습
+      · update_assembly_batch(): asm_buffer 배치 샘플로 Assembly 네트워크 학습
       · 업데이트 시 상대 네트워크 출력은 항상 detach() 처리
       · 4개 네트워크: reg_online, reg_target, asm_online, asm_target
     """
@@ -724,11 +726,8 @@ class DualDQNAgent:
             u_p = asm_net.compute_U_p(graph, prec, op_id_to_idx, obs)
         return u_p.detach()
 
-    def select_greedy(self, obs: dict, action_bonus: Optional[torch.Tensor] = None) -> int:
-        """ε 없이 순수 Q-value argmax로 액션 선택 (탐색 없음).
-
-        action_bonus: 각 액션에 더할 외부 가산점 텐서 (len(actions),). 없으면 무시.
-        """
+    def select_greedy(self, obs: dict) -> int:
+        """ε 없이 순수 Q-value argmax로 액션 선택 (탐색 없음)."""
         actions = obs["actions"]
         if not actions:
             return 0
@@ -762,21 +761,22 @@ class DualDQNAgent:
                     if local_i < q_asm.size(0):
                         q_all[global_i] = q_asm[local_i]
 
-            if action_bonus is not None:
-                q_all = q_all + action_bonus.to(self.device)
-
         return int(q_all.argmax().item())
 
-    def select_action(self, obs: dict, action_bonus: Optional[torch.Tensor] = None) -> int:
-        """ε-greedy: ε 확률 랜덤, 나머지는 두 네트워크 Q값 통합 argmax.
+    def select_action(self, obs: dict, explore_bonus: Optional[torch.Tensor] = None) -> int:
+        """ε-greedy: ε 확률 균형 편향 탐색, 나머지는 두 네트워크 Q값 통합 argmax.
 
         각 인코더를 1회만 호출해 교차 신호(C_p/U_p)와 Q-값을 모두 계산.
-        action_bonus: 그리디 선택 시 Q-value에 더할 외부 가산점 텐서 (len(actions),).
+        explore_bonus: 탐색 구간에서 softmax 샘플링 가중치로 사용할 텐서 (len(actions),).
+                       탐색 구간에서만 적용되며 greedy 선택에는 영향을 미치지 않음.
         """
         actions = obs["actions"]
         if not actions:
             return 0
         if random.random() < self.epsilon:
+            if explore_bonus is not None and explore_bonus.abs().sum().item() > 1e-6:
+                weights = torch.softmax(explore_bonus.float(), dim=0)
+                return int(torch.multinomial(weights, 1).item())
             return random.randint(0, len(actions) - 1)
 
         graph, _, prec, op_id_to_idx, job_op_map = self._parse_obs(obs)
@@ -810,62 +810,7 @@ class DualDQNAgent:
                     if local_i < q_asm.size(0):
                         q_all[global_i] = q_asm[local_i]
 
-            if action_bonus is not None:
-                q_all = q_all + action_bonus.to(self.device)
-
         return int(q_all.argmax().item())
-
-    def update_regular(self, trajectory: list) -> dict:
-        """
-        Regular action 스텝만 TD loss 계산 → reg_online 업데이트.
-        U_p 는 asm_online/asm_target 에서 detach 해 입력.
-        """
-        reg_steps = [
-            (obs, act, r, nobs, done)
-            for obs, act, r, nobs, done in trajectory
-            if act < len(obs["actions"]) and not _is_assembly(obs["actions"][act])
-        ]
-        if not reg_steps:
-            return {"loss_reg": 0.0}
-
-        self.reg_optimizer.zero_grad()
-        loss_sum = 0.0
-
-        for obs, action_idx, reward, next_obs, done in reg_steps:
-            graph, actions, prec, op_id_to_idx, _ = self._parse_obs(obs)
-            u_p = self._compute_u_p(obs, use_target=False)
-
-            q_vals = self.reg_online(graph, actions, prec, op_id_to_idx, u_p=u_p)
-
-            reg_global = [i for i, a in enumerate(actions) if not _is_assembly(a)]
-            if action_idx not in reg_global:
-                continue
-            local_idx = min(reg_global.index(action_idx), q_vals.size(0) - 1)
-            q_val = q_vals[local_idx]
-
-            if done or not next_obs["actions"]:
-                target = torch.tensor(float(reward), device=self.device)
-            else:
-                ng, na, np_, noi, njm = self._parse_obs(next_obs)
-                nu_p = self._compute_u_p(next_obs, use_target=True)
-                nc_p = self._compute_c_p(next_obs, use_target=True)
-                next_reg = [a for a in na if not _is_assembly(a)]
-                next_asm = [a for a in na if     _is_assembly(a)]
-                with torch.no_grad():
-                    nq_reg = (self.reg_target(ng, na, np_, noi, u_p=nu_p).max()
-                              if next_reg else torch.tensor(0.0, device=self.device))
-                target = torch.tensor(float(reward), device=self.device) + self.gamma * nq_reg
-
-            loss_sum += F.mse_loss(q_val, target.detach())
-
-        if loss_sum == 0.0:
-            return {"loss_reg": 0.0}
-
-        loss = loss_sum / len(reg_steps)
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.reg_online.parameters(), self.max_grad_norm)
-        self.reg_optimizer.step()
-        return {"loss_reg": loss.item()}
 
     def update_regular_batch(self, batch: list) -> dict:
         """reg_buffer 샘플 배치로 Regular 네트워크 업데이트.
@@ -1014,58 +959,6 @@ class DualDQNAgent:
             return {"loss_asm": 0.0}
 
         loss = torch.stack(losses).mean()
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.asm_online.parameters(), self.max_grad_norm)
-        self.asm_optimizer.step()
-        return {"loss_asm": loss.item()}
-
-    def update_assembly(self, trajectory: list) -> dict:
-        """
-        Assembly action 스텝만 TD loss 계산 → asm_online 업데이트.
-        C_p 는 reg_online/reg_target 에서 detach 해 입력.
-        """
-        asm_steps = [
-            (obs, act, r, nobs, done)
-            for obs, act, r, nobs, done in trajectory
-            if act < len(obs["actions"]) and _is_assembly(obs["actions"][act])
-        ]
-        if not asm_steps:
-            return {"loss_asm": 0.0}
-
-        self.asm_optimizer.zero_grad()
-        loss_sum = 0.0
-
-        for obs, action_idx, reward, next_obs, done in asm_steps:
-            graph, actions, prec, op_id_to_idx, job_op_map = self._parse_obs(obs)
-            c_p = self._compute_c_p(obs, use_target=False)
-
-            q_vals = self.asm_online(graph, actions, prec, op_id_to_idx, job_op_map, c_p=c_p)
-
-            asm_global = [i for i, a in enumerate(actions) if _is_assembly(a)]
-            if action_idx not in asm_global:
-                continue
-            local_idx = min(asm_global.index(action_idx), q_vals.size(0) - 1)
-            q_val = q_vals[local_idx]
-
-            if done or not next_obs["actions"]:
-                target = torch.tensor(float(reward), device=self.device)
-            else:
-                ng, na, np_, noi, njm = self._parse_obs(next_obs)
-                nc_p = self._compute_c_p(next_obs, use_target=True)
-                nu_p = self._compute_u_p(next_obs, use_target=True)
-                next_reg = [a for a in na if not _is_assembly(a)]
-                next_asm = [a for a in na if     _is_assembly(a)]
-                with torch.no_grad():
-                    nq_asm = (self.asm_target(ng, na, np_, noi, njm, c_p=nc_p).max()
-                              if next_asm else torch.tensor(0.0, device=self.device))
-                target = torch.tensor(float(reward), device=self.device) + self.gamma * nq_asm
-
-            loss_sum += F.mse_loss(q_val, target.detach())
-
-        if loss_sum == 0.0:
-            return {"loss_asm": 0.0}
-
-        loss = loss_sum / len(asm_steps)
         loss.backward()
         nn.utils.clip_grad_norm_(self.asm_online.parameters(), self.max_grad_norm)
         self.asm_optimizer.step()
