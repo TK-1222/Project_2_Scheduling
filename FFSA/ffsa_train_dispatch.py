@@ -267,10 +267,7 @@ def train(
             if not obs["actions"]:
                 break
 
-            if random.random() < agent.epsilon:
-                action_idx = select_balanced_exploration(obs, env)
-            else:
-                action_idx = agent.select_greedy(obs)
+            action_idx = agent.select_action(obs)
             next_obs, reward, done, truncated, info = env.step(action_idx)
             step_done = done or truncated
             reward += compute_imbalance_penalty(env, imbalance_weight)
@@ -286,7 +283,10 @@ def train(
             obs = next_obs
 
             if info.get("deadlock"):
-                ep_deadlock = True
+                ep_deadlock   = True
+                total_reward += -100.0
+                dl_act = next((i for i, a in enumerate(obs["actions"]) if not _is_assembly(a)), 0)
+                reg_buffer.push(obs, dl_act, -100.0, obs, True)
                 break
 
             # train_freq 스텝마다 배치 학습 + soft target update
