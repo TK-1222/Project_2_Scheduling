@@ -88,7 +88,7 @@ class Logger:
 def run_eval(agent: DualDQNAgent, eval_envs: list) -> float:
     """
     고정 인스턴스로 greedy 정책 평가 (epsilon=0, 파라미터 업데이트 없음).
-    여러 eval_env의 WT 평균을 반환.
+    순수 Q-value argmax 정책으로 여러 eval_env의 WT 평균을 반환.
     """
     saved_eps = agent.epsilon
     agent.epsilon = 0.0
@@ -100,7 +100,7 @@ def run_eval(agent: DualDQNAgent, eval_envs: list) -> float:
         while not done:
             if not obs["actions"]:
                 break
-            action_idx = agent.select_action(obs)
+            action_idx = agent.select_greedy(obs)
             obs, _, done, truncated, _ = env.step(action_idx)
             if truncated:
                 break
@@ -111,14 +111,21 @@ def run_eval(agent: DualDQNAgent, eval_envs: list) -> float:
 
 
 # ──────────────────────────────────────────────────────────
-# 균형 탐색
+# 불균형 패널티 / Q-value 가산점
 # ──────────────────────────────────────────────────────────
 
-def select_balanced_exploration(obs: dict, env) -> int:
-    """comp type 불균형 감지 → 부족한 타입 우선 선택, 균형이면 전체 랜덤."""
-    actions = obs["actions"]
+def compute_balance_bonus(obs: dict, env, weight: float = 2.0) -> torch.Tensor:
+    """각 후보 액션에 대해 comp type 균형 기여도에 비례한 Q-value 가산점을 반환.
 
-    # comp type별 진행 수 카운트 (pool 완료 + 처리 중)
+    부족한 comp type을 투입하는 액션 → 양수 보너스
+    과잉 comp type을 투입하는 액션 → 음수 보너스
+    조립/final 액션 → 0
+    균형 상태(type_counts 없거나 1종류) → 전부 0
+    """
+    actions = obs["actions"]
+    if not actions:
+        return torch.zeros(0)
+
     type_counts: dict = {}
     for unit_pool in env.assembly_pool.values():
         for type_map in unit_pool.values():
@@ -131,28 +138,26 @@ def select_balanced_exploration(obs: dict, env) -> int:
                 ct = job.component_type_idx
                 type_counts[ct] = type_counts.get(ct, 0) + 1
 
-    # 불균형 존재 시 부족한 타입 액션 우선
-    if len(type_counts) >= 2:
-        min_count = min(type_counts.values())
-        max_count = max(type_counts.values())
-        if max_count > min_count:
-            urgent = [
-                i for i, action in enumerate(actions)
-                if not _is_assembly(action)
-                and env.instance.jobs[env.operations[action[0]].job_id].is_component
-                and type_counts.get(
-                    env.instance.jobs[env.operations[action[0]].job_id].component_type_idx, 0
-                ) == min_count
-            ]
-            if urgent:
-                return random.choice(urgent)
+    if len(type_counts) < 2:
+        return torch.zeros(len(actions))
 
-    return random.randint(0, len(actions) - 1)
+    mean_count = sum(type_counts.values()) / len(type_counts)
+    bonuses = []
+    for action in actions:
+        if _is_assembly(action):
+            bonuses.append(0.0)
+            continue
+        op_id = action[0]
+        job = env.instance.jobs[env.operations[op_id].job_id]
+        if not job.is_component:
+            bonuses.append(0.0)
+            continue
+        ct = job.component_type_idx
+        # (평균 - 현재 count) * weight: 부족할수록 양수, 과잉일수록 음수
+        bonuses.append((mean_count - type_counts.get(ct, 0)) * weight)
 
+    return torch.tensor(bonuses, dtype=torch.float32)
 
-# ──────────────────────────────────────────────────────────
-# 불균형 패널티
-# ──────────────────────────────────────────────────────────
 
 def compute_imbalance_penalty(env, weight: float = 5.0) -> float:
     """조립 버퍼 + 처리 중인 comp job 기준 comp type 불균형에 비례한 패널티."""
@@ -191,6 +196,7 @@ def train(
     epsilon_min: float = 0.05,
     epsilon_decay: float = 0.995,
     imbalance_weight: float = 5.0,
+    balance_bonus_weight: float = 2.0,
     hidden_dim: int = 16,
     device: str = "cpu",
     log_interval: int = 10,
@@ -267,7 +273,8 @@ def train(
             if not obs["actions"]:
                 break
 
-            action_idx = agent.select_action(obs)
+            bonus = compute_balance_bonus(obs, env, balance_bonus_weight)
+            action_idx = agent.select_action(obs, explore_bonus=bonus)
             next_obs, reward, done, truncated, info = env.step(action_idx)
             step_done = done or truncated
             reward += compute_imbalance_penalty(env, imbalance_weight)
@@ -283,10 +290,11 @@ def train(
             obs = next_obs
 
             if info.get("deadlock"):
-                ep_deadlock   = True
-                total_reward += -100.0
-                dl_act = next((i for i, a in enumerate(obs["actions"]) if not _is_assembly(a)), 0)
-                reg_buffer.push(obs, dl_act, -100.0, obs, True)
+                ep_deadlock = True
+                # done=True이므로 next_obs 내용은 Bellman 타겟에 미사용 (target=r)
+                dl_acts = [i for i, a in enumerate(obs["actions"]) if not _is_assembly(a)]
+                if dl_acts:
+                    reg_buffer.push(obs, dl_acts[0], -100.0, obs, True)
                 break
 
             # train_freq 스텝마다 배치 학습 + soft target update
@@ -422,8 +430,9 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon-start",      type=float, default=1.0)
     parser.add_argument("--epsilon-min",        type=float, default=0.05)
     parser.add_argument("--epsilon-decay",      type=float, default=0.995)
-    parser.add_argument("--imbalance-weight",   type=float, default=5.0)
-    parser.add_argument("--hidden-dim",         type=int,   default=16)
+    parser.add_argument("--imbalance-weight",     type=float, default=5.0)
+    parser.add_argument("--balance-bonus-weight", type=float, default=2.0)
+    parser.add_argument("--hidden-dim",           type=int,   default=16)
     parser.add_argument("--device",             type=str,   default="cpu")
     parser.add_argument("--exp-name",           type=str,   default=None)
     parser.add_argument("--test-only",          action="store_true")
@@ -463,6 +472,7 @@ if __name__ == "__main__":
             epsilon_min=args.epsilon_min,
             epsilon_decay=args.epsilon_decay,
             imbalance_weight=args.imbalance_weight,
+            balance_bonus_weight=args.balance_bonus_weight,
             hidden_dim=args.hidden_dim,
             device=args.device,
             exp_name=exp_name,
