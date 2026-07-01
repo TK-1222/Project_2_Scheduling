@@ -112,46 +112,6 @@ def run_eval(agent: DualDQNAgent, eval_envs: list, balance_bonus_weight: float =
 
 
 # ──────────────────────────────────────────────────────────
-# 균형 탐색
-# ──────────────────────────────────────────────────────────
-
-def select_balanced_exploration(obs: dict, env) -> int:
-    """comp type 불균형 감지 → 부족한 타입 우선 선택, 균형이면 전체 랜덤."""
-    actions = obs["actions"]
-
-    # comp type별 진행 수 카운트 (pool 완료 + 처리 중)
-    type_counts: dict = {}
-    for unit_pool in env.assembly_pool.values():
-        for type_map in unit_pool.values():
-            for comp_type in type_map:
-                type_counts[comp_type] = type_counts.get(comp_type, 0) + 1
-    for op in env.operations.values():
-        if op.active and op.is_processing:
-            job = env.instance.jobs[op.job_id]
-            if job.is_component:
-                ct = job.component_type_idx
-                type_counts[ct] = type_counts.get(ct, 0) + 1
-
-    # 불균형 존재 시 부족한 타입 액션 우선
-    if len(type_counts) >= 2:
-        min_count = min(type_counts.values())
-        max_count = max(type_counts.values())
-        if max_count > min_count:
-            urgent = [
-                i for i, action in enumerate(actions)
-                if not _is_assembly(action)
-                and env.instance.jobs[env.operations[action[0]].job_id].is_component
-                and type_counts.get(
-                    env.instance.jobs[env.operations[action[0]].job_id].component_type_idx, 0
-                ) == min_count
-            ]
-            if urgent:
-                return random.choice(urgent)
-
-    return random.randint(0, len(actions) - 1)
-
-
-# ──────────────────────────────────────────────────────────
 # 불균형 패널티 / Q-value 가산점
 # ──────────────────────────────────────────────────────────
 
@@ -470,8 +430,9 @@ if __name__ == "__main__":
     parser.add_argument("--epsilon-start",      type=float, default=1.0)
     parser.add_argument("--epsilon-min",        type=float, default=0.05)
     parser.add_argument("--epsilon-decay",      type=float, default=0.995)
-    parser.add_argument("--imbalance-weight",   type=float, default=5.0)
-    parser.add_argument("--hidden-dim",         type=int,   default=16)
+    parser.add_argument("--imbalance-weight",     type=float, default=5.0)
+    parser.add_argument("--balance-bonus-weight", type=float, default=2.0)
+    parser.add_argument("--hidden-dim",           type=int,   default=16)
     parser.add_argument("--device",             type=str,   default="cpu")
     parser.add_argument("--exp-name",           type=str,   default=None)
     parser.add_argument("--test-only",          action="store_true")
@@ -511,6 +472,7 @@ if __name__ == "__main__":
             epsilon_min=args.epsilon_min,
             epsilon_decay=args.epsilon_decay,
             imbalance_weight=args.imbalance_weight,
+            balance_bonus_weight=args.balance_bonus_weight,
             hidden_dim=args.hidden_dim,
             device=args.device,
             exp_name=exp_name,
