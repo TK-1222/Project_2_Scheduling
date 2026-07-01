@@ -710,22 +710,6 @@ class DualDQNAgent:
         return (obs["graph"], obs["actions"], prec,
                 op_id_to_idx, obs.get("job_op_map", {}))
 
-    def _compute_c_p(self, obs: dict, use_target: bool = False) -> torch.Tensor:
-        """C_p 만 계산 (Regular → Assembly). use_target=True 이면 reg_target 사용."""
-        graph, _, prec, op_id_to_idx, _ = self._parse_obs(obs)
-        reg_net = self.reg_target if use_target else self.reg_online
-        with torch.no_grad():
-            c_p = reg_net.compute_C_p(graph, prec, op_id_to_idx, obs)
-        return c_p.detach()
-
-    def _compute_u_p(self, obs: dict, use_target: bool = False) -> torch.Tensor:
-        """U_p 만 계산 (Assembly → Regular). use_target=True 이면 asm_target 사용."""
-        graph, _, prec, op_id_to_idx, _ = self._parse_obs(obs)
-        asm_net = self.asm_target if use_target else self.asm_online
-        with torch.no_grad():
-            u_p = asm_net.compute_U_p(graph, prec, op_id_to_idx, obs)
-        return u_p.detach()
-
     def select_greedy(self, obs: dict) -> int:
         """ε 없이 순수 Q-value argmax로 액션 선택 (탐색 없음)."""
         actions = obs["actions"]
@@ -775,7 +759,7 @@ class DualDQNAgent:
             return 0
         if random.random() < self.epsilon:
             if explore_bonus is not None and explore_bonus.abs().sum().item() > 1e-6:
-                weights = torch.softmax(explore_bonus.float(), dim=0)
+                weights = torch.softmax(explore_bonus.float().to(self.device), dim=0)
                 return int(torch.multinomial(weights, 1).item())
             return random.randint(0, len(actions) - 1)
 
@@ -870,7 +854,6 @@ class DualDQNAgent:
 
                 with torch.no_grad():
                     nu_p = self.asm_target.compute_U_p_from_embeddings(op_h_asm_t, ng, next_obs)
-                    nc_p = self.reg_target.compute_C_p_from_embeddings(op_h_reg_t, next_obs)
                     nq_reg = (self.reg_target.forward_from_embeddings(
                                   op_h_reg_t, machine_h_reg_t, na, ng, noi, u_p=nu_p
                               ).max()
@@ -938,7 +921,7 @@ class DualDQNAgent:
                 target = torch.tensor(float(reward), device=self.device)
             else:
                 ng, na, np_, noi, njm = parsed_nobs[i]
-                op_h_reg_t, machine_h_reg_t = reg_target_nobs[i]
+                op_h_reg_t, _ = reg_target_nobs[i]
                 op_h_asm_t, machine_h_asm_t = asm_target_nobs[i]
 
                 next_reg = [a for a in na if not _is_assembly(a)]
@@ -946,7 +929,6 @@ class DualDQNAgent:
 
                 with torch.no_grad():
                     nc_p = self.reg_target.compute_C_p_from_embeddings(op_h_reg_t, next_obs)
-                    nu_p = self.asm_target.compute_U_p_from_embeddings(op_h_asm_t, ng, next_obs)
                     nq_asm = (self.asm_target.forward_from_embeddings(
                                   op_h_asm_t, machine_h_asm_t, na, noi, njm, c_p=nc_p
                               ).max()
