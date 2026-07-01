@@ -724,8 +724,11 @@ class DualDQNAgent:
             u_p = asm_net.compute_U_p(graph, prec, op_id_to_idx, obs)
         return u_p.detach()
 
-    def select_greedy(self, obs: dict) -> int:
-        """ε 없이 순수 Q-value argmax로 액션 선택 (탐색 없음)."""
+    def select_greedy(self, obs: dict, action_bonus: Optional[torch.Tensor] = None) -> int:
+        """ε 없이 순수 Q-value argmax로 액션 선택 (탐색 없음).
+
+        action_bonus: 각 액션에 더할 외부 가산점 텐서 (len(actions),). 없으면 무시.
+        """
         actions = obs["actions"]
         if not actions:
             return 0
@@ -759,12 +762,16 @@ class DualDQNAgent:
                     if local_i < q_asm.size(0):
                         q_all[global_i] = q_asm[local_i]
 
+            if action_bonus is not None:
+                q_all = q_all + action_bonus.to(self.device)
+
         return int(q_all.argmax().item())
 
-    def select_action(self, obs: dict) -> int:
+    def select_action(self, obs: dict, action_bonus: Optional[torch.Tensor] = None) -> int:
         """ε-greedy: ε 확률 랜덤, 나머지는 두 네트워크 Q값 통합 argmax.
 
         각 인코더를 1회만 호출해 교차 신호(C_p/U_p)와 Q-값을 모두 계산.
+        action_bonus: 그리디 선택 시 Q-value에 더할 외부 가산점 텐서 (len(actions),).
         """
         actions = obs["actions"]
         if not actions:
@@ -802,6 +809,9 @@ class DualDQNAgent:
                 for local_i, global_i in enumerate(asm_idx):
                     if local_i < q_asm.size(0):
                         q_all[global_i] = q_asm[local_i]
+
+            if action_bonus is not None:
+                q_all = q_all + action_bonus.to(self.device)
 
         return int(q_all.argmax().item())
 

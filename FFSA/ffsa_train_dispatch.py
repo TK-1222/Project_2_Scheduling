@@ -85,7 +85,7 @@ class Logger:
 # 고정 인스턴스 평가
 # ──────────────────────────────────────────────────────────
 
-def run_eval(agent: DualDQNAgent, eval_envs: list) -> float:
+def run_eval(agent: DualDQNAgent, eval_envs: list, balance_bonus_weight: float = 2.0) -> float:
     """
     고정 인스턴스로 greedy 정책 평가 (epsilon=0, 파라미터 업데이트 없음).
     여러 eval_env의 WT 평균을 반환.
@@ -100,7 +100,8 @@ def run_eval(agent: DualDQNAgent, eval_envs: list) -> float:
         while not done:
             if not obs["actions"]:
                 break
-            action_idx = agent.select_action(obs)
+            bonus = compute_balance_bonus(obs, env, balance_bonus_weight)
+            action_idx = agent.select_greedy(obs, action_bonus=bonus)
             obs, _, done, truncated, _ = env.step(action_idx)
             if truncated:
                 break
@@ -151,8 +152,53 @@ def select_balanced_exploration(obs: dict, env) -> int:
 
 
 # ──────────────────────────────────────────────────────────
-# 불균형 패널티
+# 불균형 패널티 / Q-value 가산점
 # ──────────────────────────────────────────────────────────
+
+def compute_balance_bonus(obs: dict, env, weight: float = 2.0) -> torch.Tensor:
+    """각 후보 액션에 대해 comp type 균형 기여도에 비례한 Q-value 가산점을 반환.
+
+    부족한 comp type을 투입하는 액션 → 양수 보너스
+    과잉 comp type을 투입하는 액션 → 음수 보너스
+    조립/final 액션 → 0
+    균형 상태(type_counts 없거나 1종류) → 전부 0
+    """
+    actions = obs["actions"]
+    if not actions:
+        return torch.zeros(0)
+
+    type_counts: dict = {}
+    for unit_pool in env.assembly_pool.values():
+        for type_map in unit_pool.values():
+            for comp_type in type_map:
+                type_counts[comp_type] = type_counts.get(comp_type, 0) + 1
+    for op in env.operations.values():
+        if op.active and op.is_processing:
+            job = env.instance.jobs[op.job_id]
+            if job.is_component:
+                ct = job.component_type_idx
+                type_counts[ct] = type_counts.get(ct, 0) + 1
+
+    if len(type_counts) < 2:
+        return torch.zeros(len(actions))
+
+    mean_count = sum(type_counts.values()) / len(type_counts)
+    bonuses = []
+    for action in actions:
+        if _is_assembly(action):
+            bonuses.append(0.0)
+            continue
+        op_id = action[0]
+        job = env.instance.jobs[env.operations[op_id].job_id]
+        if not job.is_component:
+            bonuses.append(0.0)
+            continue
+        ct = job.component_type_idx
+        # (평균 - 현재 count) * weight: 부족할수록 양수, 과잉일수록 음수
+        bonuses.append((mean_count - type_counts.get(ct, 0)) * weight)
+
+    return torch.tensor(bonuses, dtype=torch.float32)
+
 
 def compute_imbalance_penalty(env, weight: float = 5.0) -> float:
     """조립 버퍼 + 처리 중인 comp job 기준 comp type 불균형에 비례한 패널티."""
@@ -191,6 +237,7 @@ def train(
     epsilon_min: float = 0.05,
     epsilon_decay: float = 0.995,
     imbalance_weight: float = 5.0,
+    balance_bonus_weight: float = 2.0,
     hidden_dim: int = 16,
     device: str = "cpu",
     log_interval: int = 10,
@@ -267,7 +314,8 @@ def train(
             if not obs["actions"]:
                 break
 
-            action_idx = agent.select_action(obs)
+            bonus = compute_balance_bonus(obs, env, balance_bonus_weight)
+            action_idx = agent.select_action(obs, action_bonus=bonus)
             next_obs, reward, done, truncated, info = env.step(action_idx)
             step_done = done or truncated
             reward += compute_imbalance_penalty(env, imbalance_weight)
@@ -319,7 +367,7 @@ def train(
 
         # 고정 인스턴스 평가
         if eval_envs and ep % eval_interval == 0:
-            eval_wt = run_eval(agent, eval_envs)
+            eval_wt = run_eval(agent, eval_envs, balance_bonus_weight)
             logger.log_eval(ep, eval_wt)
             print(f"  → [EVAL] ep={ep}  eval_wt={eval_wt:.2f}")
 

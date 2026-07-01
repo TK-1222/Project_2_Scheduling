@@ -1097,44 +1097,12 @@ class FFSASchedulingEnv(gym.Env):
                 return op.op_id
         return None
 
-    def _apply_balance(self) -> Optional[int]:
-        """BALANCE: comp type 불균형 감지 → 부족한 type의 ready op 중 FIFO 선택."""
-        type_counts: Dict[int, int] = {}
-        for unit_pool in self.assembly_pool.values():
-            for type_map in unit_pool.values():
-                for comp_type in type_map:
-                    type_counts[comp_type] = type_counts.get(comp_type, 0) + 1
-        for op in self.operations.values():
-            if op.active and op.is_processing:
-                job = self.instance.jobs[op.job_id]
-                if job.is_component:
-                    ct = job.component_type_idx
-                    type_counts[ct] = type_counts.get(ct, 0) + 1
-
-        if len(type_counts) < 2:
-            return None
-        min_count = min(type_counts.values())
-        if min_count == max(type_counts.values()):
-            return None  # 균형 상태 — 다른 룰에 위임
-
-        lagging = {ct for ct, cnt in type_counts.items() if cnt == min_count}
-        candidates = [
-            op for op in self.operations.values()
-            if (op.active and op.is_ready and not op.is_processing and not op.is_assembly
-                and self.instance.jobs[op.job_id].is_component
-                and self.instance.jobs[op.job_id].component_type_idx in lagging
-                and self._best_machine_for_op(op) is not None)
-        ]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda o: o.job_id).op_id
-
     def _get_valid_action_pairs(self) -> List[Action]:
-        # 일반 공정: 룰 6개 → op 후보 수집 → op × 모든 호환 기계 조합
+        # 일반 공정: 룰 5개 → op 후보 수집 → op × 모든 호환 기계 조합
         op_candidates: List[int] = []
         op_seen: set = set()
         for op_id in [self._apply_fifo(), self._apply_edd(), self._apply_mwkr(),
-                      self._apply_spt(), self._apply_winq(), self._apply_balance()]:
+                      self._apply_spt(), self._apply_winq()]:
             if op_id is not None and op_id not in op_seen:
                 op_candidates.append(op_id)
                 op_seen.add(op_id)
