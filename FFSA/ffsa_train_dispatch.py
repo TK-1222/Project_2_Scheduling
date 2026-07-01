@@ -261,7 +261,7 @@ def train(
 
     save_dir     = f"runs/{exp_name}/checkpoints"
     os.makedirs(save_dir, exist_ok=True)
-    best_ever_wt = float("inf")
+    best_ever_eval_wt = float("inf")  # eval_envs 기반 저장 (데드락 WT=0 면역)
 
     for ep in range(1, num_episodes + 1):
         obs, _ = env.reset()
@@ -278,6 +278,9 @@ def train(
             next_obs, reward, done, truncated, info = env.step(action_idx)
             step_done = done or truncated
             reward += compute_imbalance_penalty(env, imbalance_weight)
+            # 데드락 패널티를 마지막 스텝 reward에 포함 — 단일 전이로 학습 (Sutton & Barto §6.1)
+            if info.get("deadlock"):
+                reward += -100.0
 
             # 액션 타입에 따라 버퍼 분리 push
             if _is_assembly(obs["actions"][action_idx]):
@@ -291,10 +294,6 @@ def train(
 
             if info.get("deadlock"):
                 ep_deadlock = True
-                # done=True이므로 next_obs 내용은 Bellman 타겟에 미사용 (target=r)
-                dl_acts = [i for i, a in enumerate(obs["actions"]) if not _is_assembly(a)]
-                if dl_acts:
-                    reg_buffer.push(obs, dl_acts[0], -100.0, obs, True)
                 break
 
             # train_freq 스텝마다 배치 학습 + soft target update
@@ -325,23 +324,22 @@ def train(
         logger.log_episode(ep, wt, ms, total_reward, ep_deadlock, agent.epsilon)
         logger.log_buffer(ep, len(reg_buffer), len(asm_buffer))
 
-        # 고정 인스턴스 평가
+        warmup_done = len(reg_buffer) >= learn_start
+
+        # 고정 인스턴스 평가 + 체크포인트 저장 (eval_wt 기준 — 데드락 WT=0 면역)
         if eval_envs and ep % eval_interval == 0:
             eval_wt = run_eval(agent, eval_envs)
             logger.log_eval(ep, eval_wt)
             print(f"  → [EVAL] ep={ep}  eval_wt={eval_wt:.2f}")
-
-        # 워밍업 완료 후 최저 WT 갱신 시 저장
-        warmup_done = len(reg_buffer) >= learn_start
-        if warmup_done and wt < best_ever_wt:
-            best_ever_wt = wt
-            torch.save({
-                "ep": ep,
-                "best_wt": best_ever_wt,
-                "reg_online": agent.reg_online.state_dict(),
-                "asm_online": agent.asm_online.state_dict(),
-            }, f"{save_dir}/best_model.pt")
-            print(f"  → [SAVED] ep={ep}  best_wt={best_ever_wt:.2f}")
+            if warmup_done and eval_wt < best_ever_eval_wt:
+                best_ever_eval_wt = eval_wt
+                torch.save({
+                    "ep": ep,
+                    "best_eval_wt": best_ever_eval_wt,
+                    "reg_online": agent.reg_online.state_dict(),
+                    "asm_online": agent.asm_online.state_dict(),
+                }, f"{save_dir}/best_model.pt")
+                print(f"  → [SAVED] ep={ep}  eval_wt={best_ever_eval_wt:.2f}")
 
         if ep % hist_interval == 0:
             logger.log_weights(ep, agent.reg_online, agent.asm_online)
