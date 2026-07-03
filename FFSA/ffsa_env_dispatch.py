@@ -383,7 +383,7 @@ class FFSASchedulingEnv(gym.Env):
     def step(self, action_idx: int):
         actions = self._current_actions
         if action_idx >= len(actions):
-            # 액션 없음 → 진행 불가, truncated 처리
+            print(f"[DEADLOCK] step() early exit: action_idx={action_idx}, len(actions)={len(actions)}, t={self.current_time:.1f}")
             return self._get_obs(), -1.0, False, True, {"deadlock": True}
 
         action = actions[action_idx]
@@ -510,6 +510,20 @@ class FFSASchedulingEnv(gym.Env):
                 # done 상태이면 정상 종료, 아니면 deadlock
                 if not self._check_done():
                     self._deadlock_detected = True
+                    active_ops = [op for op in self.operations.values() if op.active]
+                    machines = list(self.machine_states.values())
+                    print(
+                        f"[DEADLOCK] advance loop: t={self.current_time:.1f} | "
+                        f"ops active={len(active_ops)} "
+                        f"(done={sum(o.is_done for o in active_ops)}, "
+                        f"processing={sum(o.is_processing for o in active_ops)}, "
+                        f"ready={sum(o.is_ready for o in active_ops)}, "
+                        f"waiting={sum(o.buffer_waiting and not o.is_ready for o in active_ops)}) | "
+                        f"machines idle={sum(m.is_idle for m in machines)} "
+                        f"blocked={sum(m.is_blocked for m in machines)} | "
+                        f"pool_units={sum(len(v) for p in self.assembly_pool.values() for v in p.values())} "
+                        f"inactive_finals={len(self.inactive_final_jobs)}"
+                    )
                 break
 
             next_time = min(op.completion_time for op in processing)
