@@ -51,13 +51,13 @@ class InstanceConfig:
     final_stage_prob: float = 0.7      # final job 스테이지 방문 확률
     use_assembly: bool = True
     use_setup: bool = True
-    use_finite_buffer: bool = True
+    use_finite_buffer: bool = False
     assembly_buffer_capacity: int = -1  # -1 = 무한 (Constraint 10)
     seed: Optional[int] = 42
     # 정규주문 (t=0 도착)
     num_regular_orders: int = 6
     regular_quantity_range: Tuple[int, int] = (1, 3)
-    regular_due_date_range: Tuple[float, float] = (250.0, 500.0)
+    regular_due_date_range: Tuple[float, float] = (150.0, 350.0)
 
 
 # ──────────────────────────────────────────────────────────
